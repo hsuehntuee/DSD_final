@@ -114,6 +114,8 @@ module RISCV_CORE (
     reg        ID_EX_alu_src, ID_EX_mem_to_reg, ID_EX_pc_to_alu;
     reg        ID_EX_branch, ID_EX_jump, ID_EX_jalr, ID_EX_is_flush;
     reg        ID_EX_is_mult, ID_EX_is_rvc;
+    reg        ID_EX_pred_taken;
+    reg [31:0] ID_EX_pred_target;
 
     reg [31:0] EX_MEM_alu_out, EX_MEM_rs2_data;
     reg [4:0]  EX_MEM_rd;
@@ -127,6 +129,7 @@ module RISCV_CORE (
     wire load_use_stall;
     wire branch_taken;
     wire [31:0] branch_target;
+    wire [31:0] correction_target;
     wire [31:0] wb_data = (MEM_WB_mem_to_reg) ? MEM_WB_mem_rdata : MEM_WB_alu_out;
 
     // -------------------------------------------------------------------------
@@ -134,8 +137,20 @@ module RISCV_CORE (
     // -------------------------------------------------------------------------
     reg  [31:0] pc;
     reg state_if;
+    reg [31:0] btb_tag    [0:31];
+    reg [31:0] btb_target [0:31];
+    reg [1:0]  btb_state  [0:31];
+    reg        btb_valid  [0:31];
+
+    wire [4:0] btb_idx = pc[6:2];
+    wire btb_hit = btb_valid[btb_idx] && (btb_tag[btb_idx] == pc);
+    wire predict_taken = btb_hit && (btb_state[btb_idx] >= 2'd2);
+    wire [31:0] predict_target = btb_target[btb_idx];
+
     parameter IF_NORMAL = 1'b0, IF_CROSS = 1'b1;
     reg [15:0] cross_word_lower;
+    reg        IF_ID_pred_taken;
+    reg [31:0] IF_ID_pred_target;
 
     wire [31:0] fetch_pc = (state_if == IF_CROSS) ? {pc[31:2], 2'b00} + 4 : {pc[31:2], 2'b00};
     assign o_icache_addr = fetch_pc;
@@ -160,6 +175,8 @@ module RISCV_CORE (
     wire actual_is_32bit = (state_if == IF_CROSS) ? 1'b1 : is_32bit_inst;
     wire [31:0] pc_next_norm = pc + (actual_is_32bit ? 4 : 2);
     wire actual_is_rvc = !actual_is_32bit;
+    
+    wire [31:0] pc_next_pred = (predict_taken && !if_stall_req) ? predict_target : pc_next_norm;
 
     wire mult_stall;
     wire mem_stall = i_icache_stall | i_dcache_stall;
@@ -185,8 +202,8 @@ module RISCV_CORE (
     always @(posedge clk) begin
         if (!rst_n) pc <= 32'b0;
         else if (!global_stall) begin
-            if (branch_taken) pc <= branch_target;
-            else if (!front_stall) pc <= pc_next_norm;
+            if (branch_taken) pc <= correction_target;
+            else if (!front_stall) pc <= pc_next_pred;
         end
     end
 
@@ -195,15 +212,21 @@ module RISCV_CORE (
             IF_ID_pc   <= 32'b0;
             IF_ID_inst <= 32'h00000013;
             IF_ID_is_rvc <= 0;
+            IF_ID_pred_taken  <= 0;
+            IF_ID_pred_target <= 32'b0;
         end else if (!global_stall) begin
             if (branch_taken) begin
                 IF_ID_pc   <= 32'b0;
                 IF_ID_inst <= 32'h00000013;
                 IF_ID_is_rvc <= 0;
+                IF_ID_pred_taken  <= 0;
+                IF_ID_pred_target <= 32'b0;
             end else if (!front_stall) begin
                 IF_ID_pc   <= pc;
                 IF_ID_inst <= expanded_inst;
                 IF_ID_is_rvc <= actual_is_rvc;
+                IF_ID_pred_taken  <= predict_taken;
+                IF_ID_pred_target <= predict_target;
             end
         end
     end
@@ -323,6 +346,7 @@ module RISCV_CORE (
                 ID_EX_branch <= 0; ID_EX_jump <= 0; ID_EX_jalr <= 0;
                 ID_EX_is_flush <= 0; ID_EX_rd <= 0; ID_EX_pc_to_alu <= 0;
                 ID_EX_is_mult <= 0; ID_EX_is_rvc <= 0;
+                ID_EX_pred_taken <= 0; ID_EX_pred_target <= 0;
             end else begin
                 ID_EX_pc       <= IF_ID_pc;
                 ID_EX_rs1_data <= rs1_data;
@@ -344,6 +368,8 @@ module RISCV_CORE (
                 ID_EX_pc_to_alu<= ctrl_pc_to_alu;
                 ID_EX_is_mult  <= ctrl_is_mult;
                 ID_EX_is_rvc   <= IF_ID_is_rvc;
+                ID_EX_pred_taken <= IF_ID_pred_taken;
+                ID_EX_pred_target <= IF_ID_pred_target;
             end
         end
     end
@@ -407,7 +433,40 @@ module RISCV_CORE (
     assign mult_stall = ID_EX_is_mult && !mult_busy;
 
     assign branch_target = (ID_EX_jalr) ? ((alu_in1_base + ID_EX_imm) & ~32'd1) : (ID_EX_pc + ID_EX_imm);
-    assign branch_taken  = ID_EX_jump | ID_EX_jalr | (ID_EX_branch & alu_zero);
+    wire actual_taken  = ID_EX_jump | ID_EX_jalr | (ID_EX_branch & alu_zero);
+    
+    // Correction PC if mispredicted
+    assign correction_target = (actual_taken) ? branch_target : (ID_EX_pc + (ID_EX_is_rvc ? 2 : 4));
+    
+    assign branch_taken = (ID_EX_branch || ID_EX_jump || ID_EX_jalr) && 
+                          (actual_taken != ID_EX_pred_taken || (actual_taken && (branch_target != ID_EX_pred_target)));
+    
+    // We must use correction_target when branch_taken (misprediction) is high
+    wire [31:0] final_branch_target = correction_target;
+    
+    // Update PC logic in IF uses 'branch_target' wire. Let's rename it to final_branch_target in IF.
+    // I will change the assignment in the always block.
+    
+    // Update BTB
+    wire [4:0] ex_btb_idx = ID_EX_pc[6:2];
+    integer j;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            for (j=0; j<32; j=j+1) begin
+                btb_valid[j] <= 0;
+                btb_state[j] <= 2'b01; // Weakly Not Taken
+            end
+        end else if (!global_stall && (ID_EX_branch || ID_EX_jump || ID_EX_jalr)) begin
+            btb_valid[ex_btb_idx]  <= 1;
+            btb_tag[ex_btb_idx]    <= ID_EX_pc;
+            btb_target[ex_btb_idx] <= branch_target;
+            if (actual_taken) begin
+                if (btb_state[ex_btb_idx] != 2'd3) btb_state[ex_btb_idx] <= btb_state[ex_btb_idx] + 1;
+            end else begin
+                if (btb_state[ex_btb_idx] != 2'd0) btb_state[ex_btb_idx] <= btb_state[ex_btb_idx] - 1;
+            end
+        end
+    end
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -681,16 +740,19 @@ module DCACHE (
     input              i_mem_ready
 );
 
-    reg         valid [0:15];
-    reg         dirty [0:15];
-    reg [23:0]  tag   [0:15];
-    reg [127:0] data  [0:15];
+    reg         valid0 [0:15], valid1 [0:15];
+    reg         dirty0 [0:15], dirty1 [0:15];
+    reg [23:0]  tag0   [0:15], tag1   [0:15];
+    reg [127:0] data0  [0:15], data1  [0:15];
+    reg         lru    [0:15]; // 0: way0 is LRU, 1: way1 is LRU
 
     wire [3:0]  idx = i_cpu_addr[7:4];
     wire [23:0] cur_tag = i_cpu_addr[31:8];
     wire [1:0]  word_offset = i_cpu_addr[3:2];
 
-    wire hit = valid[idx] && (tag[idx] == cur_tag);
+    wire hit0 = valid0[idx] && (tag0[idx] == cur_tag);
+    wire hit1 = valid1[idx] && (tag1[idx] == cur_tag);
+    wire hit = hit0 || hit1;
     wire cpu_req = i_cpu_ren | i_cpu_wen;
 
     parameter IDLE       = 3'd0;
@@ -702,7 +764,8 @@ module DCACHE (
     parameter FLUSH_WAIT = 3'd6; 
     
     reg [2:0] state, next_state;
-    reg [4:0] flush_idx;
+    reg [5:0] flush_cnt; // 0-31 for 2 ways x 16 sets
+    reg       way_sel;   // Way being replaced
 
     always @(posedge clk) begin
         if (!rst_n) state <= IDLE;
@@ -714,8 +777,10 @@ module DCACHE (
             IDLE: begin
                 if (i_flush) next_state = FLUSH;
                 else if (cpu_req && !hit) begin
-                    if (valid[idx] && dirty[idx]) next_state = WRITE_BACK;
-                    else next_state = ALLOCATE;
+                    if (!valid0[idx]) next_state = ALLOCATE;
+                    else if (!valid1[idx]) next_state = ALLOCATE;
+                    else if (lru[idx] == 0) next_state = (dirty0[idx]) ? WRITE_BACK : ALLOCATE;
+                    else next_state = (dirty1[idx]) ? WRITE_BACK : ALLOCATE;
                 end else next_state = IDLE;
             end
             WRITE_BACK: next_state = (i_mem_ready) ? WB_WAIT : WRITE_BACK;
@@ -723,15 +788,31 @@ module DCACHE (
             ALLOCATE:   next_state = (i_mem_ready) ? ALLOC_WAIT : ALLOCATE;
             ALLOC_WAIT: next_state = IDLE;
             FLUSH: begin
-                if (flush_idx == 16) next_state = IDLE;
-                else if (valid[flush_idx] && dirty[flush_idx]) 
-                    next_state = (i_mem_ready) ? FLUSH_WAIT : FLUSH;
-                else 
-                    next_state = FLUSH;
+                if (flush_cnt == 32) next_state = IDLE;
+                else begin
+                    if (flush_cnt < 16) begin
+                        if (valid0[flush_cnt[3:0]] && dirty0[flush_cnt[3:0]]) 
+                            next_state = (i_mem_ready) ? FLUSH_WAIT : FLUSH;
+                        else next_state = FLUSH;
+                    end else begin
+                        if (valid1[flush_cnt[3:0]] && dirty1[flush_cnt[3:0]]) 
+                            next_state = (i_mem_ready) ? FLUSH_WAIT : FLUSH;
+                        else next_state = FLUSH;
+                    end
+                end
             end
             FLUSH_WAIT: next_state = FLUSH;
             default: next_state = IDLE;
         endcase
+    end
+
+    always @(posedge clk) begin
+        if (!rst_n) way_sel <= 0;
+        else if (state == IDLE && cpu_req && !hit) begin
+            if (!valid0[idx]) way_sel <= 0;
+            else if (!valid1[idx]) way_sel <= 1;
+            else way_sel <= lru[idx];
+        end
     end
 
     always @(*) begin
@@ -741,23 +822,32 @@ module DCACHE (
         o_mem_wdata = 128'b0;
         if (state == WRITE_BACK) begin
             o_mem_write = 1;
-            o_mem_addr  = {tag[idx], idx};
-            o_mem_wdata = data[idx];
+            o_mem_addr  = (way_sel == 0) ? {tag0[idx], idx} : {tag1[idx], idx};
+            o_mem_wdata = (way_sel == 0) ? data0[idx] : data1[idx];
         end else if (state == ALLOCATE) begin
             o_mem_read  = 1;
             o_mem_addr  = i_cpu_addr[31:4];
-        end else if (state == FLUSH && flush_idx < 16 && valid[flush_idx] && dirty[flush_idx]) begin
-            o_mem_write = 1;
-            o_mem_addr  = {tag[flush_idx[3:0]], flush_idx[3:0]};
-            o_mem_wdata = data[flush_idx];
+        end else if (state == FLUSH && flush_cnt < 32) begin
+            if (flush_cnt < 16) begin
+                if (valid0[flush_cnt[3:0]] && dirty0[flush_cnt[3:0]]) begin
+                    o_mem_write = 1;
+                    o_mem_addr  = {tag0[flush_cnt[3:0]], flush_cnt[3:0]};
+                    o_mem_wdata = data0[flush_cnt[3:0]];
+                end
+            end else begin
+                if (valid1[flush_cnt[3:0]] && dirty1[flush_cnt[3:0]]) begin
+                    o_mem_write = 1;
+                    o_mem_addr  = {tag1[flush_cnt[3:0]], flush_cnt[3:0]};
+                    o_mem_wdata = data1[flush_cnt[3:0]];
+                end
+            end
         end
     end
 
     assign o_cpu_stall = (cpu_req && !hit) || (state != IDLE && state != FLUSH);
     assign o_cpu_valid = hit && (state == IDLE);
     
-    wire [127:0] hit_block = data[idx];
-    
+    wire [127:0] hit_block = hit0 ? data0[idx] : data1[idx];
     assign o_cpu_rdata = (word_offset == 2'b00) ? hit_block[31:0] :
                          (word_offset == 2'b01) ? hit_block[63:32] :
                          (word_offset == 2'b10) ? hit_block[95:64] : hit_block[127:96];
@@ -766,40 +856,61 @@ module DCACHE (
     always @(posedge clk) begin
         if (!rst_n) begin
             for (i=0; i<16; i=i+1) begin
-                valid[i] <= 0;
-                dirty[i] <= 0;
+                valid0[i] <= 0; valid1[i] <= 0;
+                dirty0[i] <= 0; dirty1[i] <= 0;
+                lru[i] <= 0;
             end
-            flush_idx <= 0;
+            flush_cnt <= 0;
             o_flush_done <= 0;
         end else begin
-            if (state == FLUSH && flush_idx == 16) o_flush_done <= 1;
+            if (state == FLUSH && flush_cnt == 32) o_flush_done <= 1;
             else o_flush_done <= 0;
 
             case(state)
                 IDLE: begin
-                    if (cpu_req && hit && i_cpu_wen) begin
-                        dirty[idx] <= 1;
-                        if (word_offset == 2'b00) data[idx][31:0]   <= i_cpu_wdata;
-                        if (word_offset == 2'b01) data[idx][63:32]  <= i_cpu_wdata;
-                        if (word_offset == 2'b10) data[idx][95:64]  <= i_cpu_wdata;
-                        if (word_offset == 2'b11) data[idx][127:96] <= i_cpu_wdata;
+                    if (i_flush) flush_cnt <= 0;
+                    if (cpu_req && hit) begin
+                        lru[idx] <= hit0 ? 1 : 0;
+                        if (i_cpu_wen) begin
+                            if (hit0) begin
+                                dirty0[idx] <= 1;
+                                if (word_offset == 2'b00) data0[idx][31:0]   <= i_cpu_wdata;
+                                if (word_offset == 2'b01) data0[idx][63:32]  <= i_cpu_wdata;
+                                if (word_offset == 2'b10) data0[idx][95:64]  <= i_cpu_wdata;
+                                if (word_offset == 2'b11) data0[idx][127:96] <= i_cpu_wdata;
+                            end else begin
+                                dirty1[idx] <= 1;
+                                if (word_offset == 2'b00) data1[idx][31:0]   <= i_cpu_wdata;
+                                if (word_offset == 2'b01) data1[idx][63:32]  <= i_cpu_wdata;
+                                if (word_offset == 2'b10) data1[idx][95:64]  <= i_cpu_wdata;
+                                if (word_offset == 2'b11) data1[idx][127:96] <= i_cpu_wdata;
+                            end
+                        end
                     end
                 end
                 ALLOCATE: begin
                     if (i_mem_ready) begin
-                        valid[idx] <= 1;
-                        dirty[idx] <= 0;
-                        tag[idx]   <= cur_tag;
-                        data[idx]  <= i_mem_rdata;
+                        if (way_sel == 0) begin
+                            valid0[idx] <= 1; dirty0[idx] <= 0; tag0[idx] <= cur_tag; data0[idx] <= i_mem_rdata;
+                        end else begin
+                            valid1[idx] <= 1; dirty1[idx] <= 0; tag1[idx] <= cur_tag; data1[idx] <= i_mem_rdata;
+                        end
                     end
                 end
                 FLUSH: begin
-                    if (flush_idx < 16) begin
-                        if (!(valid[flush_idx] && dirty[flush_idx])) begin
-                            flush_idx <= flush_idx + 1;
-                        end else if (i_mem_ready) begin
-                            dirty[flush_idx] <= 0;
-                            flush_idx <= flush_idx + 1;
+                    if (flush_cnt < 32) begin
+                        if (flush_cnt < 16) begin
+                            if (!(valid0[flush_cnt[3:0]] && dirty0[flush_cnt[3:0]])) flush_cnt <= flush_cnt + 1;
+                            else if (i_mem_ready) begin
+                                dirty0[flush_cnt[3:0]] <= 0;
+                                flush_cnt <= flush_cnt + 1;
+                            end
+                        end else begin
+                            if (!(valid1[flush_cnt[3:0]] && dirty1[flush_cnt[3:0]])) flush_cnt <= flush_cnt + 1;
+                            else if (i_mem_ready) begin
+                                dirty1[flush_cnt[3:0]] <= 0;
+                                flush_cnt <= flush_cnt + 1;
+                            end
                         end
                     end
                 end
