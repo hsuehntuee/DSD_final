@@ -584,7 +584,6 @@ module RISCV_CORE (
     assign o_dcache_ren   = EX_MEM_mem_read;
     assign o_dcache_wen   = EX_MEM_mem_write;
     assign o_dcache_addr  = EX_MEM_alu_out;
-    assign o_flush        = EX_MEM_is_flush;
     
     assign o_dcache_wdata = {EX_MEM_rs2_data[7:0], EX_MEM_rs2_data[15:8], EX_MEM_rs2_data[23:16], EX_MEM_rs2_data[31:24]};
 
