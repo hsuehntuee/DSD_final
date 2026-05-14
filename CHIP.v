@@ -23,7 +23,8 @@ module CHIP (
     output              o_done
 );
 
-    wire [31:0] icache_inst, icache_addr;
+    wire [127:0] icache_data;
+    wire [31:0] icache_addr;
     wire        icache_valid, icache_stall;
 
     wire [31:0] dcache_rdata, dcache_wdata, dcache_addr;
@@ -33,7 +34,7 @@ module CHIP (
     RISCV_CORE core (
         .clk            (clk),
         .rst_n          (rst_n),
-        .i_icache_inst  (icache_inst),
+        .i_icache_data  (icache_data),
         .i_icache_valid (icache_valid),
         .i_icache_stall (icache_stall),
         .o_icache_addr  (icache_addr),
@@ -52,7 +53,7 @@ module CHIP (
         .clk            (clk),
         .rst_n          (rst_n),
         .i_cpu_addr     (icache_addr),
-        .o_cpu_inst     (icache_inst),
+        .o_cpu_data     (icache_data),
         .o_cpu_valid    (icache_valid),
         .o_cpu_stall    (icache_stall),
         .o_mem_read     (mem_read_I),
@@ -90,7 +91,7 @@ endmodule
 module RISCV_CORE (
     input         clk,
     input         rst_n,
-    input  [31:0] i_icache_inst,
+    input  [127:0] i_icache_data,
     input         i_icache_valid,
     input         i_icache_stall,
     output [31:0] o_icache_addr,
@@ -118,7 +119,7 @@ module RISCV_CORE (
     reg        ID_EX_is_mult, ID_EX_is_rvc;
     reg        ID_EX_pred_taken;
     reg [31:0] ID_EX_pred_target;
-    reg [7:0]  ID_EX_ghr;
+    reg [9:0]  ID_EX_ghr;
 
     reg [31:0] EX_MEM_alu_out, EX_MEM_rs2_data;
     reg [4:0]  EX_MEM_rd;
@@ -133,6 +134,7 @@ module RISCV_CORE (
 
     // Flush Handshake
     reg flush_done_reg;
+    reg [1:0] evict_way_btb_reg;
     always @(posedge clk) begin
         if (!rst_n) flush_done_reg <= 0;
         else if (EX_MEM_is_flush && i_flush_done) flush_done_reg <= 1;
@@ -146,55 +148,67 @@ module RISCV_CORE (
     wire [31:0] correction_target;
     wire [31:0] wb_data = (MEM_WB_mem_to_reg) ? MEM_WB_mem_rdata : MEM_WB_alu_out;
 
+    reg [31:0] pc;
+    reg state_if;
+
+    wire [127:0] current_line = {
+        i_icache_data[103:96], i_icache_data[111:104], i_icache_data[119:112], i_icache_data[127:120],
+        i_icache_data[71:64],  i_icache_data[79:72],   i_icache_data[87:80],   i_icache_data[95:88],
+        i_icache_data[39:32],  i_icache_data[47:40],   i_icache_data[55:48],   i_icache_data[63:56],
+        i_icache_data[7:0],    i_icache_data[15:8],    i_icache_data[23:16],   i_icache_data[31:24]
+    };
+    wire [31:0]  shifted_line = current_line >> (pc[3:1] * 16);
+    wire [31:0]  raw_inst = shifted_line;
+
     // -------------------------------------------------------------------------
     // IF Stage
     // -------------------------------------------------------------------------
-    reg [31:0] pc;
-    reg state_if;
-    reg [31:0] btb_tag    [0:63];
-    reg [31:0] btb_target [0:63];
-    reg        btb_valid  [0:63];
+    reg [31:0] btb_tag    [0:15][0:3];
+    reg [31:0] btb_target [0:15][0:3];
+    reg        btb_valid  [0:15][0:3];
+    reg        btb_is_ret [0:15][0:3];
+    reg        btb_is_call[0:15][0:3];
+    reg [2:0]  btb_plru   [0:15];
 
     // GShare & RSB
-    reg [7:0] ghr;
-    reg [1:0] pht [0:255];
+    reg [9:0] ghr;
+    reg [1:0] pht [0:1023];
     reg [31:0] rsb_stack [0:7];
     reg [2:0]  rsb_ptr;
 
-    wire [5:0] btb_idx = pc[7:2];
-    wire [7:0] pht_idx = pc[9:2] ^ ghr;
+    wire [3:0] btb_idx = pc[5:2];
+    wire [9:0] pht_idx = pc[11:2] ^ ghr;
     
-    // We need to identify RET in IF to use RSB. 
-    // This is hard since we haven't fetched the instruction yet.
-    // So RSB is usually integrated into BTB as a "is_ret" bit.
-    reg btb_is_ret [0:63];
-    reg btb_is_call [0:63];
+    wire btb_hit0 = btb_valid[btb_idx][0] && (btb_tag[btb_idx][0] == pc);
+    wire btb_hit1 = btb_valid[btb_idx][1] && (btb_tag[btb_idx][1] == pc);
+    wire btb_hit2 = btb_valid[btb_idx][2] && (btb_tag[btb_idx][2] == pc);
+    wire btb_hit3 = btb_valid[btb_idx][3] && (btb_tag[btb_idx][3] == pc);
+    wire btb_hit  = btb_hit0 || btb_hit1 || btb_hit2 || btb_hit3;
+    wire [1:0] btb_hit_way = btb_hit0 ? 2'd0 : btb_hit1 ? 2'd1 : btb_hit2 ? 2'd2 : 2'd3;
 
-    wire predict_taken = btb_valid[btb_idx] && (btb_tag[btb_idx] == pc) && 
-                         (btb_is_call[btb_idx] || btb_is_ret[btb_idx] || (pht[pht_idx] >= 2'd2));
+    wire predict_taken = btb_hit && (btb_is_call[btb_idx][btb_hit_way] || btb_is_ret[btb_idx][btb_hit_way] || (pht[pht_idx] >= 2'd2));
     
-    wire [31:0] predict_target = (btb_valid[btb_idx] && (btb_tag[btb_idx] == pc) && btb_is_ret[btb_idx]) ? 
-                                 rsb_stack[(rsb_ptr-3'd1)] : btb_target[btb_idx];
+    wire [31:0] predict_target = (btb_hit && btb_is_ret[btb_idx][btb_hit_way]) ? 
+                                 rsb_stack[(rsb_ptr-3'd1)] : 
+                                 (btb_hit0 ? btb_target[btb_idx][0] : btb_hit1 ? btb_target[btb_idx][1] : btb_hit2 ? btb_target[btb_idx][2] : btb_target[btb_idx][3]);
 
     parameter IF_NORMAL = 1'b0, IF_CROSS = 1'b1;
     reg [15:0] cross_word_lower;
     reg        IF_ID_pred_taken;
     reg [31:0] IF_ID_pred_target;
-    reg [7:0]  IF_ID_ghr;
+    reg [9:0]  IF_ID_ghr;
 
-    wire [31:0] fetch_pc = (state_if == IF_CROSS) ? {pc[31:2], 2'b00} + 4 : {pc[31:2], 2'b00};
+    wire [31:0] fetch_pc = (state_if == IF_CROSS) ? {pc[31:4], 4'b0000} + 16 : {pc[31:4], 4'b0000};
     assign o_icache_addr = fetch_pc;
     
-    wire [31:0] inst_swapped = {i_icache_inst[7:0], i_icache_inst[15:8], i_icache_inst[23:16], i_icache_inst[31:24]};
-    
     wire pc_unaligned = pc[1];
-    wire [15:0] inst_half = pc_unaligned ? inst_swapped[31:16] : inst_swapped[15:0];
-    wire is_32bit_inst = (inst_half[1:0] == 2'b11);
+    wire is_32bit_inst = (raw_inst[1:0] == 2'b11);
     
-    wire if_stall_req = (state_if == IF_NORMAL) && pc_unaligned && is_32bit_inst && i_icache_valid;
+    // Crosses 16-byte boundary
+    wire if_stall_req = (state_if == IF_NORMAL) && (pc[3:1] == 3'd7) && is_32bit_inst && i_icache_valid;
     
-    wire [31:0] if_inst_raw = (state_if == IF_CROSS) ? {inst_swapped[15:0], cross_word_lower} :
-                              (is_32bit_inst ? inst_swapped : {16'b0, inst_half});
+    wire [31:0] if_inst_raw = (state_if == IF_CROSS) ? {current_line[15:0], cross_word_lower} :
+                              (is_32bit_inst ? raw_inst : {16'b0, raw_inst[15:0]});
                               
     wire [31:0] expanded_inst;
     RVC_EXPANDER rvc_exp(
@@ -221,7 +235,7 @@ module RISCV_CORE (
                 state_if <= IF_NORMAL;
             end else if (state_if == IF_NORMAL && if_stall_req && !mem_stall) begin
                 state_if <= IF_CROSS;
-                cross_word_lower <= inst_swapped[31:16];
+                cross_word_lower <= raw_inst[15:0];
             end else if (state_if == IF_CROSS && !global_stall && !front_stall) begin
                 state_if <= IF_NORMAL;
             end
@@ -464,23 +478,33 @@ module RISCV_CORE (
     // I will change the assignment in the always block.
     
     // Update BTB & RSB
-    wire [5:0] ex_btb_idx = ID_EX_pc[7:2];
-    wire [7:0] ex_pht_idx = ID_EX_pc[9:2] ^ ID_EX_ghr;
+    wire [3:0] ex_btb_idx = ID_EX_pc[5:2];
+    wire [9:0] ex_pht_idx = ID_EX_pc[11:2] ^ ID_EX_ghr;
+
+    wire ex_hit0 = btb_valid[ex_btb_idx][0] && (btb_tag[ex_btb_idx][0] == ID_EX_pc);
+    wire ex_hit1 = btb_valid[ex_btb_idx][1] && (btb_tag[ex_btb_idx][1] == ID_EX_pc);
+    wire ex_hit2 = btb_valid[ex_btb_idx][2] && (btb_tag[ex_btb_idx][2] == ID_EX_pc);
+    wire ex_hit3 = btb_valid[ex_btb_idx][3] && (btb_tag[ex_btb_idx][3] == ID_EX_pc);
+    wire ex_hit  = ex_hit0 || ex_hit1 || ex_hit2 || ex_hit3;
+    wire [1:0] ex_hit_way = ex_hit0 ? 2'd0 : ex_hit1 ? 2'd1 : ex_hit2 ? 2'd2 : 2'd3;
 
     // CALL: JAL/JALR with rd=1 or rd=5
     // RET: JALR with rs1=1 or rs1=5 and rd=0
     wire is_call = (ID_EX_jump || ID_EX_jalr) && (ID_EX_rd == 5'd1 || ID_EX_rd == 5'd5);
     wire is_ret  = ID_EX_jalr && (ID_EX_rs1 == 5'd1 || ID_EX_rs1 == 5'd5) && (ID_EX_rd == 5'd0);
 
-    integer j;
+    integer j, w;
     always @(posedge clk) begin
         if (!rst_n) begin
-            for (j=0; j<64; j=j+1) begin
-                btb_valid[j]   <= 0;
-                btb_is_call[j] <= 0;
-                btb_is_ret[j]  <= 0;
+            for (j=0; j<16; j=j+1) begin
+                for (w=0; w<4; w=w+1) begin
+                    btb_valid[j][w]   <= 0;
+                    btb_is_call[j][w] <= 0;
+                    btb_is_ret[j][w]  <= 0;
+                end
+                btb_plru[j] <= 0;
             end
-            for (j=0; j<256; j=j+1) pht[j] <= 2'b01; 
+            for (j=0; j<1024; j=j+1) pht[j] <= 2'b01; 
             for (j=0; j<8; j=j+1) rsb_stack[j] <= 0;
             ghr <= 0;
             rsb_ptr <= 0;
@@ -492,14 +516,37 @@ module RISCV_CORE (
                     end else begin
                         if (pht[ex_pht_idx] != 2'd0) pht[ex_pht_idx] <= pht[ex_pht_idx] - 1;
                     end
-                    ghr <= {ghr[6:0], actual_taken};
+                    ghr <= {ghr[8:0], actual_taken};
                 end
                 if (ID_EX_jump || ID_EX_jalr || actual_taken) begin
-                    btb_valid[ex_btb_idx]   <= 1;
-                    btb_tag[ex_btb_idx]     <= ID_EX_pc;
-                    btb_target[ex_btb_idx]  <= branch_target;
-                    btb_is_call[ex_btb_idx] <= is_call;
-                    btb_is_ret[ex_btb_idx]  <= is_ret;
+                    if (ex_hit) begin
+                        btb_target[ex_btb_idx][ex_hit_way] <= branch_target;
+                        btb_is_call[ex_btb_idx][ex_hit_way] <= is_call;
+                        btb_is_ret[ex_btb_idx][ex_hit_way]  <= is_ret;
+                        // Update PLRU
+                        if (ex_hit_way == 0) begin btb_plru[ex_btb_idx][0] <= 1; btb_plru[ex_btb_idx][1] <= 1; end
+                        else if (ex_hit_way == 1) begin btb_plru[ex_btb_idx][0] <= 1; btb_plru[ex_btb_idx][1] <= 0; end
+                        else if (ex_hit_way == 2) begin btb_plru[ex_btb_idx][0] <= 0; btb_plru[ex_btb_idx][2] <= 1; end
+                        else if (ex_hit_way == 3) begin btb_plru[ex_btb_idx][0] <= 0; btb_plru[ex_btb_idx][2] <= 0; end
+                    end else begin
+                        case ({btb_plru[ex_btb_idx][0], btb_plru[ex_btb_idx][1], btb_plru[ex_btb_idx][2]})
+                            3'b000, 3'b001: evict_way_btb_reg = 2'd0;
+                            3'b010, 3'b011: evict_way_btb_reg = 2'd1;
+                            3'b100, 3'b110: evict_way_btb_reg = 2'd2;
+                            3'b101, 3'b111: evict_way_btb_reg = 2'd3;
+                            default: evict_way_btb_reg = 2'd0;
+                        endcase
+                        btb_valid[ex_btb_idx][evict_way_btb_reg]   <= 1;
+                        btb_tag[ex_btb_idx][evict_way_btb_reg]     <= ID_EX_pc;
+                        btb_target[ex_btb_idx][evict_way_btb_reg]  <= branch_target;
+                        btb_is_call[ex_btb_idx][evict_way_btb_reg] <= is_call;
+                        btb_is_ret[ex_btb_idx][evict_way_btb_reg]  <= is_ret;
+                        // Update PLRU
+                        if (evict_way_btb_reg == 0) begin btb_plru[ex_btb_idx][0] <= 1; btb_plru[ex_btb_idx][1] <= 1; end
+                        else if (evict_way_btb_reg == 1) begin btb_plru[ex_btb_idx][0] <= 1; btb_plru[ex_btb_idx][1] <= 0; end
+                        else if (evict_way_btb_reg == 2) begin btb_plru[ex_btb_idx][0] <= 0; btb_plru[ex_btb_idx][2] <= 1; end
+                        else if (evict_way_btb_reg == 3) begin btb_plru[ex_btb_idx][0] <= 0; btb_plru[ex_btb_idx][2] <= 0; end
+                    end
                 end
                 // RSB Operation
                 if (is_call) begin
@@ -699,7 +746,7 @@ module ICACHE (
     input          clk,
     input          rst_n,
     input   [31:0] i_cpu_addr,
-    output  [31:0] o_cpu_inst,
+    output  [127:0] o_cpu_data,
     output         o_cpu_valid,
     output         o_cpu_stall,
     output         o_mem_read,
@@ -713,7 +760,7 @@ module ICACHE (
     reg         valid [0:15][0:3];
     reg [23:0]  tag   [0:15][0:3];
     reg [127:0] data  [0:15][0:3];
-    reg [1:0]   rr_way[0:15]; // Round Robin counter
+    reg [2:0]   plru  [0:15]; // Tree-based PLRU bits
 
     wire [3:0]  idx = i_cpu_addr[7:4];
     wire [23:0] cur_tag = i_cpu_addr[31:8];
@@ -724,23 +771,22 @@ module ICACHE (
     wire hit2 = valid[idx][2] && (tag[idx][2] == cur_tag);
     wire hit3 = valid[idx][3] && (tag[idx][3] == cur_tag);
     wire cache_hit = hit0 || hit1 || hit2 || hit3;
-    
+    wire [1:0] hit_way_idx = hit0 ? 2'd0 : hit1 ? 2'd1 : hit2 ? 2'd2 : 2'd3;
+
     assign o_cpu_valid = cache_hit;
     assign o_cpu_stall = !cache_hit;
 
-    wire [127:0] hit_block = hit0 ? data[idx][0] :
-                             hit1 ? data[idx][1] :
-                             hit2 ? data[idx][2] : data[idx][3];
-    
-    assign o_cpu_inst = (word_offset == 2'b00) ? hit_block[31:0] :
-                        (word_offset == 2'b01) ? hit_block[63:32] :
-                        (word_offset == 2'b10) ? hit_block[95:64] : hit_block[127:96];
+    assign o_cpu_data = hit0 ? data[idx][0] :
+                        hit1 ? data[idx][1] :
+                        hit2 ? data[idx][2] : data[idx][3];
 
     reg [1:0] state, next_state;
-    parameter IDLE = 2'd0, FETCH = 2'd1, WAIT_MEM = 2'd2;
+    parameter IDLE = 2'd0, FETCH = 2'd1;
 
     reg [31:0] prefetch_addr;
     reg        prefetch_pending;
+    reg [31:4] mem_addr_reg;
+    reg        is_prefetch_reg;
 
     always @(posedge clk) begin
         if (!rst_n) state <= IDLE;
@@ -762,42 +808,57 @@ module ICACHE (
     assign o_mem_read  = (state == FETCH);
     assign o_mem_write = 1'b0;
     assign o_mem_wdata = 128'b0;
-    assign o_mem_addr  = (state == FETCH && !cache_hit) ? i_cpu_addr[31:4] : prefetch_addr[31:4];
+    assign o_mem_addr  = mem_addr_reg;
+
+    wire [1:0] fill_way = (plru[mem_addr_reg[7:4]][0] == 0) ? (plru[mem_addr_reg[7:4]][1] == 0 ? 2'd0 : 2'd1) : (plru[mem_addr_reg[7:4]][2] == 0 ? 2'd2 : 2'd3);
 
     integer i, w;
     always @(posedge clk) begin
         if (!rst_n) begin
             for (i=0; i<16; i=i+1) begin
                 for (w=0; w<4; w=w+1) valid[i][w] <= 0;
-                rr_way[i] <= 0;
+                plru[i] <= 0;
             end
             prefetch_pending <= 0;
             prefetch_addr <= 0;
+            mem_addr_reg <= 0;
+            is_prefetch_reg <= 0;
         end else begin
-            // Prefetch logic
             if (state == IDLE && cache_hit) begin
+                // Update PLRU on hit
+                if (hit_way_idx == 0) begin plru[idx][0] <= 1; plru[idx][1] <= 1; end
+                else if (hit_way_idx == 1) begin plru[idx][0] <= 1; plru[idx][1] <= 0; end
+                else if (hit_way_idx == 2) begin plru[idx][0] <= 0; plru[idx][2] <= 1; end
+                else if (hit_way_idx == 3) begin plru[idx][0] <= 0; plru[idx][2] <= 0; end
+
                 if (!prefetch_pending && prefetch_addr != (i_cpu_addr + 16)) begin
                     prefetch_addr <= (i_cpu_addr + 16);
                     prefetch_pending <= 1;
                 end
             end
 
-            if (state == FETCH && i_mem_ready) begin
-                // Check if this was a prefetch or a real miss
+            if (state == IDLE && next_state == FETCH) begin
                 if (!cache_hit) begin
-                    valid[idx][rr_way[idx]] <= 1'b1;
-                    tag[idx][rr_way[idx]]   <= cur_tag;
-                    data[idx][rr_way[idx]]  <= i_mem_rdata;
-                    rr_way[idx] <= rr_way[idx] + 1;
-                    // Reset prefetch if it matches the current miss
-                    if (prefetch_pending && prefetch_addr[31:4] == i_cpu_addr[31:4]) prefetch_pending <= 0;
-                end else if (prefetch_pending) begin
-                    valid[prefetch_addr[7:4]][rr_way[prefetch_addr[7:4]]] <= 1'b1;
-                    tag[prefetch_addr[7:4]][rr_way[prefetch_addr[7:4]]]   <= prefetch_addr[31:8];
-                    data[prefetch_addr[7:4]][rr_way[prefetch_addr[7:4]]]  <= i_mem_rdata;
-                    rr_way[prefetch_addr[7:4]] <= rr_way[prefetch_addr[7:4]] + 1;
-                    prefetch_pending <= 0;
+                    mem_addr_reg <= i_cpu_addr[31:4];
+                    is_prefetch_reg <= 0;
+                end else begin
+                    mem_addr_reg <= prefetch_addr[31:4];
+                    is_prefetch_reg <= 1;
                 end
+            end
+
+            if (state == FETCH && i_mem_ready) begin
+                valid[mem_addr_reg[7:4]][fill_way] <= 1'b1;
+                tag[mem_addr_reg[7:4]][fill_way]   <= mem_addr_reg[31:8];
+                data[mem_addr_reg[7:4]][fill_way]  <= i_mem_rdata;
+                // Update PLRU on fill
+                if (fill_way == 0) begin plru[mem_addr_reg[7:4]][0] <= 1; plru[mem_addr_reg[7:4]][1] <= 1; end
+                else if (fill_way == 1) begin plru[mem_addr_reg[7:4]][0] <= 1; plru[mem_addr_reg[7:4]][1] <= 0; end
+                else if (fill_way == 2) begin plru[mem_addr_reg[7:4]][0] <= 0; plru[mem_addr_reg[7:4]][2] <= 1; end
+                else if (fill_way == 3) begin plru[mem_addr_reg[7:4]][0] <= 0; plru[mem_addr_reg[7:4]][2] <= 0; end
+                
+                if (prefetch_pending && prefetch_addr[31:4] == mem_addr_reg) prefetch_pending <= 0;
+                else if (is_prefetch_reg) prefetch_pending <= 0;
             end
         end
     end
@@ -830,7 +891,7 @@ module DCACHE (
     reg         dirty [0:15][0:3];
     reg [23:0]  tag   [0:15][0:3];
     reg [127:0] data  [0:15][0:3];
-    reg [1:0]   rr_way[0:15]; 
+    reg [2:0]   plru  [0:15]; // Tree-based PLRU bits
 
     wire [3:0]  idx = i_cpu_addr[7:4];
     wire [23:0] cur_tag = i_cpu_addr[31:8];
@@ -844,18 +905,25 @@ module DCACHE (
     wire [1:0] hit_way = hit0 ? 2'd0 : hit1 ? 2'd1 : hit2 ? 2'd2 : 2'd3;
     
     wire cpu_req = i_cpu_ren | i_cpu_wen;
+    wire [1:0] evict_way = (plru[idx][0] == 0) ? (plru[idx][1] == 0 ? 2'd0 : 2'd1) : (plru[idx][2] == 0 ? 2'd2 : 2'd3);
 
     parameter IDLE       = 3'd0;
-    parameter WRITE_BACK = 3'd1;
-    parameter WB_WAIT    = 3'd2; 
-    parameter ALLOCATE   = 3'd3;
-    parameter ALLOC_WAIT = 3'd4; 
-    parameter FLUSH      = 3'd5;
-    parameter FLUSH_WAIT = 3'd6; 
+    parameter ALLOCATE   = 3'd1;
+    parameter WB_WBB     = 3'd2; // Write back the WBB
+    parameter FLUSH      = 3'd3;
     
     reg [2:0] state, next_state;
-    reg [5:0] flush_cnt; // 0-63 for 4 ways x 16 sets
-    reg [1:0] way_sel;   // Way being replaced
+    reg [5:0] flush_cnt;
+    reg [1:0] way_sel_reg;
+
+    // Write-Back Buffer
+    reg         wbb_valid;
+    reg [23:0]  wbb_tag;
+    reg [3:0]   wbb_idx;
+    reg [127:0] wbb_data;
+
+    // WBB Hazard: CPU requests the SAME line that is in WBB
+    wire wbb_hazard = wbb_valid && (wbb_idx == idx) && (wbb_tag == cur_tag);
 
     always @(posedge clk) begin
         if (!rst_n) state <= IDLE;
@@ -867,16 +935,21 @@ module DCACHE (
             IDLE: begin
                 if (i_flush) next_state = FLUSH;
                 else if (cpu_req && !hit) begin
-                    if (dirty[idx][rr_way[idx]] && valid[idx][rr_way[idx]]) next_state = WRITE_BACK;
+                    // If WBB is valid and we need another eviction, or WBB hazard, must clear WBB first
+                    if (wbb_valid && (dirty[idx][evict_way] || wbb_hazard)) next_state = WB_WBB;
                     else next_state = ALLOCATE;
+                end else if (wbb_valid) begin
+                    next_state = WB_WBB; // Flush WBB in background
                 end else next_state = IDLE;
             end
-            WRITE_BACK: next_state = (i_mem_ready) ? ALLOCATE : WRITE_BACK;
-            ALLOCATE:   next_state = (i_mem_ready) ? IDLE : ALLOCATE;
+            WB_WBB:   next_state = (i_mem_ready) ? IDLE : WB_WBB;
+            ALLOCATE: next_state = (i_mem_ready) ? IDLE : ALLOCATE;
             FLUSH: begin
-                if (flush_cnt == 63 && (!valid[15][3] || !dirty[15][3] || i_mem_ready)) next_state = IDLE;
-                else if (valid[flush_cnt[3:0]][flush_cnt[5:4]] && dirty[flush_cnt[3:0]][flush_cnt[5:4]])
-                    next_state = (i_mem_ready) ? FLUSH : FLUSH; // Stay in FLUSH and increment
+                if (flush_cnt == 63 && (!valid[15][3] || !dirty[15][3] || i_mem_ready)) begin
+                    if (wbb_valid) next_state = WB_WBB; // Final WBB clear
+                    else next_state = IDLE;
+                end else if (valid[flush_cnt[3:0]][flush_cnt[5:4]] && dirty[flush_cnt[3:0]][flush_cnt[5:4]])
+                    next_state = (i_mem_ready) ? FLUSH : FLUSH; 
                 else next_state = FLUSH;
             end
             default: next_state = IDLE;
@@ -884,8 +957,8 @@ module DCACHE (
     end
 
     always @(posedge clk) begin
-        if (!rst_n) way_sel <= 0;
-        else if (state == IDLE && cpu_req && !hit) way_sel <= rr_way[idx];
+        if (!rst_n) way_sel_reg <= 0;
+        else if (state == IDLE && cpu_req && !hit) way_sel_reg <= evict_way;
     end
 
     always @(*) begin
@@ -893,10 +966,10 @@ module DCACHE (
         o_mem_write = 0;
         o_mem_addr  = 28'b0;
         o_mem_wdata = 128'b0;
-        if (state == WRITE_BACK) begin
+        if (state == WB_WBB) begin
             o_mem_write = 1;
-            o_mem_addr  = {tag[idx][way_sel], idx};
-            o_mem_wdata = data[idx][way_sel];
+            o_mem_addr  = {wbb_tag, wbb_idx};
+            o_mem_wdata = wbb_data;
         end else if (state == ALLOCATE) begin
             o_mem_read  = 1;
             o_mem_addr  = i_cpu_addr[31:4];
@@ -909,8 +982,11 @@ module DCACHE (
         end
     end
 
-    assign o_cpu_stall = (cpu_req && !hit) || (state != IDLE && state != FLUSH);
-    assign o_cpu_valid = hit && (state == IDLE);
+    // Stall if missing and either:
+    // 1. We are allocating/flushing/wb_wbb
+    // 2. We have a WBB hazard
+    assign o_cpu_stall = (cpu_req && !hit) || (state != IDLE && state != FLUSH) || wbb_hazard;
+    assign o_cpu_valid = hit && (state == IDLE) && !wbb_hazard;
     
     wire [127:0] hit_block = data[idx][hit_way];
     assign o_cpu_rdata = (word_offset == 2'b00) ? hit_block[31:0] :
@@ -925,18 +1001,26 @@ module DCACHE (
                     valid[i][w] <= 0;
                     dirty[i][w] <= 0;
                 end
-                rr_way[i] <= 0;
+                plru[i] <= 0;
             end
             flush_cnt <= 0;
             o_flush_done <= 0;
+            wbb_valid <= 0;
         end else begin
-            if (state == FLUSH && next_state == IDLE) o_flush_done <= 1;
+            if (state == FLUSH && next_state == IDLE && !wbb_valid) o_flush_done <= 1;
+            else if (state == WB_WBB && next_state == IDLE && i_flush) o_flush_done <= 1; // Done with final flush
             else o_flush_done <= 0;
 
             case(state)
                 IDLE: begin
                     if (i_flush) flush_cnt <= 0;
-                    if (cpu_req && hit) begin
+                    if (cpu_req && hit && !wbb_hazard) begin
+                        // Update PLRU on hit
+                        if (hit_way == 0) begin plru[idx][0] <= 1; plru[idx][1] <= 1; end
+                        else if (hit_way == 1) begin plru[idx][0] <= 1; plru[idx][1] <= 0; end
+                        else if (hit_way == 2) begin plru[idx][0] <= 0; plru[idx][2] <= 1; end
+                        else if (hit_way == 3) begin plru[idx][0] <= 0; plru[idx][2] <= 0; end
+
                         if (i_cpu_wen) begin
                             dirty[idx][hit_way] <= 1;
                             if (word_offset == 2'b00) data[idx][hit_way][31:0]   <= i_cpu_wdata;
@@ -945,14 +1029,28 @@ module DCACHE (
                             if (word_offset == 2'b11) data[idx][hit_way][127:96] <= i_cpu_wdata;
                         end
                     end
+                    // Moving to ALLOCATE: if dirty, buffer it
+                    if (next_state == ALLOCATE && dirty[idx][evict_way] && valid[idx][evict_way]) begin
+                        wbb_valid <= 1;
+                        wbb_tag   <= tag[idx][evict_way];
+                        wbb_idx   <= idx;
+                        wbb_data  <= data[idx][evict_way];
+                    end
+                end
+                WB_WBB: begin
+                    if (i_mem_ready) wbb_valid <= 0;
                 end
                 ALLOCATE: begin
                     if (i_mem_ready) begin
-                        valid[idx][way_sel] <= 1; 
-                        dirty[idx][way_sel] <= 0; 
-                        tag[idx][way_sel]   <= cur_tag; 
-                        data[idx][way_sel]  <= i_mem_rdata;
-                        rr_way[idx] <= rr_way[idx] + 1;
+                        valid[idx][way_sel_reg] <= 1; 
+                        dirty[idx][way_sel_reg] <= 0; 
+                        tag[idx][way_sel_reg]   <= cur_tag; 
+                        data[idx][way_sel_reg]  <= i_mem_rdata;
+                        // Update PLRU on fill
+                        if (way_sel_reg == 0) begin plru[idx][0] <= 1; plru[idx][1] <= 1; end
+                        else if (way_sel_reg == 1) begin plru[idx][0] <= 1; plru[idx][1] <= 0; end
+                        else if (way_sel_reg == 2) begin plru[idx][0] <= 0; plru[idx][2] <= 1; end
+                        else if (way_sel_reg == 3) begin plru[idx][0] <= 0; plru[idx][2] <= 0; end
                     end
                 end
                 FLUSH: begin
