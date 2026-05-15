@@ -1,5 +1,6 @@
 // -----------------------------------------------------------------------------
 // DSD Final Project: Pipelined RISC-V Processor with I/D Caches, RV32M, RV32C
+// 突破 3.5ns 極限版：分支預測運算前移 (Early Branch Calc) + 專用比較器
 // -----------------------------------------------------------------------------
 
 module CHIP (
@@ -22,11 +23,9 @@ module CHIP (
     // ---------- for TestBed --------------
     output              o_done
 );
-
     wire [127:0] icache_data;
     wire [31:0] icache_addr;
     wire        icache_valid, icache_stall;
-
     wire [31:0] dcache_rdata, dcache_wdata, dcache_addr;
     wire        dcache_ren, dcache_wen, dcache_valid, dcache_stall;
     wire        flush_req;
@@ -105,7 +104,6 @@ module RISCV_CORE (
     output        o_flush,
     input         i_flush_done
 );
-
     wire [31:0] dcache_rdata_swapped = {i_dcache_rdata[7:0], i_dcache_rdata[15:8], i_dcache_rdata[23:16], i_dcache_rdata[31:24]};
 
     reg [31:0] IF_ID_pc, IF_ID_inst;
@@ -120,21 +118,22 @@ module RISCV_CORE (
     reg        ID_EX_pred_taken;
     reg [31:0] ID_EX_pred_target;
     reg [9:0]  ID_EX_ghr;
+    
+    // 🔥 新增：在 ID 階段提早算好的分支目標，減輕 EX 階段加法器負擔
+    reg [31:0] ID_EX_branch_target;
+    reg [31:0] ID_EX_fallthrough_pc;
 
     reg [31:0] EX_MEM_alu_out, EX_MEM_rs2_data;
     reg [4:0]  EX_MEM_rd;
     reg [3:0]  EX_MEM_alu_op;
     reg        EX_MEM_reg_write, EX_MEM_mem_read, EX_MEM_mem_write;
     reg        EX_MEM_mem_to_reg, EX_MEM_is_flush, EX_MEM_is_mult;
-    reg [63:0] EX_MEM_mult_res;
 
     reg [31:0] MEM_WB_alu_out, MEM_WB_mem_rdata;
     reg [4:0]  MEM_WB_rd;
     reg        MEM_WB_reg_write, MEM_WB_mem_to_reg;
 
-    // Flush Handshake
     reg flush_done_reg;
-    reg [1:0] evict_way_btb_reg;
     always @(posedge clk) begin
         if (!rst_n) flush_done_reg <= 0;
         else if (EX_MEM_is_flush && i_flush_done) flush_done_reg <= 1;
@@ -142,15 +141,17 @@ module RISCV_CORE (
     end
     assign o_flush = EX_MEM_is_flush && !flush_done_reg;
 
-    wire load_use_stall;
+    wire mem_stall = i_icache_stall | i_dcache_stall | (EX_MEM_is_flush && !flush_done_reg);
+    wire global_stall = mem_stall;
+
+    wire load_use_stall; 
+    wire front_stall;    
     wire branch_taken;
-    wire [31:0] branch_target;
     wire [31:0] correction_target;
     wire [31:0] wb_data = (MEM_WB_mem_to_reg) ? MEM_WB_mem_rdata : MEM_WB_alu_out;
 
     reg [31:0] pc;
     reg state_if;
-
     wire [127:0] current_line = {
         i_icache_data[103:96], i_icache_data[111:104], i_icache_data[119:112], i_icache_data[127:120],
         i_icache_data[71:64],  i_icache_data[79:72],   i_icache_data[87:80],   i_icache_data[95:88],
@@ -161,16 +162,15 @@ module RISCV_CORE (
     wire [31:0]  raw_inst = shifted_line;
 
     // -------------------------------------------------------------------------
-    // IF Stage
+    // IF Stage (BTB 1D Arrays)
     // -------------------------------------------------------------------------
-    reg [31:0] btb_tag    [0:15][0:3];
-    reg [31:0] btb_target [0:15][0:3];
-    reg        btb_valid  [0:15][0:3];
-    reg        btb_is_ret [0:15][0:3];
-    reg        btb_is_call[0:15][0:3];
-    reg [2:0]  btb_plru   [0:15];
-
-    // GShare & RSB
+    reg [31:0] btb_tag_0 [0:15]; reg [31:0] btb_tag_1 [0:15]; reg [31:0] btb_tag_2 [0:15]; reg [31:0] btb_tag_3 [0:15];
+    reg [31:0] btb_tgt_0 [0:15]; reg [31:0] btb_tgt_1 [0:15]; reg [31:0] btb_tgt_2 [0:15]; reg [31:0] btb_tgt_3 [0:15];
+    reg        btb_val_0 [0:15]; reg        btb_val_1 [0:15]; reg        btb_val_2 [0:15]; reg        btb_val_3 [0:15];
+    reg        btb_ret_0 [0:15]; reg        btb_ret_1 [0:15]; reg        btb_ret_2 [0:15]; reg        btb_ret_3 [0:15];
+    reg        btb_cal_0 [0:15]; reg        btb_cal_1 [0:15]; reg        btb_cal_2 [0:15]; reg        btb_cal_3 [0:15];
+    reg [2:0]  btb_plru  [0:15];
+    
     reg [9:0] ghr;
     reg [1:0] pht [0:1023];
     reg [31:0] rsb_stack [0:7];
@@ -179,18 +179,18 @@ module RISCV_CORE (
     wire [3:0] btb_idx = pc[5:2];
     wire [9:0] pht_idx = pc[11:2] ^ ghr;
     
-    wire btb_hit0 = btb_valid[btb_idx][0] && (btb_tag[btb_idx][0] == pc);
-    wire btb_hit1 = btb_valid[btb_idx][1] && (btb_tag[btb_idx][1] == pc);
-    wire btb_hit2 = btb_valid[btb_idx][2] && (btb_tag[btb_idx][2] == pc);
-    wire btb_hit3 = btb_valid[btb_idx][3] && (btb_tag[btb_idx][3] == pc);
-    wire btb_hit  = btb_hit0 || btb_hit1 || btb_hit2 || btb_hit3;
-    wire [1:0] btb_hit_way = btb_hit0 ? 2'd0 : btb_hit1 ? 2'd1 : btb_hit2 ? 2'd2 : 2'd3;
-
-    wire predict_taken = btb_hit && (btb_is_call[btb_idx][btb_hit_way] || btb_is_ret[btb_idx][btb_hit_way] || (pht[pht_idx] >= 2'd2));
+    wire btb_hit0 = btb_val_0[btb_idx] && (btb_tag_0[btb_idx] == pc);
+    wire btb_hit1 = btb_val_1[btb_idx] && (btb_tag_1[btb_idx] == pc);
+    wire btb_hit2 = btb_val_2[btb_idx] && (btb_tag_2[btb_idx] == pc);
+    wire btb_hit3 = btb_val_3[btb_idx] && (btb_tag_3[btb_idx] == pc);
+    wire btb_hit = btb_hit0 || btb_hit1 || btb_hit2 || btb_hit3;
     
-    wire [31:0] predict_target = (btb_hit && btb_is_ret[btb_idx][btb_hit_way]) ? 
-                                 rsb_stack[(rsb_ptr-3'd1)] : 
-                                 (btb_hit0 ? btb_target[btb_idx][0] : btb_hit1 ? btb_target[btb_idx][1] : btb_hit2 ? btb_target[btb_idx][2] : btb_target[btb_idx][3]);
+    wire is_call_hit = btb_hit0 ? btb_cal_0[btb_idx] : btb_hit1 ? btb_cal_1[btb_idx] : btb_hit2 ? btb_cal_2[btb_idx] : btb_hit3 ? btb_cal_3[btb_idx] : 1'b0;
+    wire is_ret_hit  = btb_hit0 ? btb_ret_0[btb_idx] : btb_hit1 ? btb_ret_1[btb_idx] : btb_hit2 ? btb_ret_2[btb_idx] : btb_hit3 ? btb_ret_3[btb_idx] : 1'b0;
+    wire [31:0] target_hit = btb_hit0 ? btb_tgt_0[btb_idx] : btb_hit1 ? btb_tgt_1[btb_idx] : btb_hit2 ? btb_tgt_2[btb_idx] : btb_hit3 ? btb_tgt_3[btb_idx] : 32'b0;
+
+    wire predict_taken = btb_hit && (is_call_hit || is_ret_hit || (pht[pht_idx] >= 2'd2));
+    wire [31:0] predict_target = (btb_hit && is_ret_hit) ? rsb_stack[(rsb_ptr-3'd1)] : target_hit;
 
     parameter IF_NORMAL = 1'b0, IF_CROSS = 1'b1;
     reg [15:0] cross_word_lower;
@@ -201,76 +201,36 @@ module RISCV_CORE (
     wire [31:0] fetch_pc = (state_if == IF_CROSS) ? {pc[31:4], 4'b0000} + 16 : {pc[31:4], 4'b0000};
     assign o_icache_addr = fetch_pc;
     
-    wire pc_unaligned = pc[1];
     wire is_32bit_inst = (raw_inst[1:0] == 2'b11);
-    
-    // Crosses 16-byte boundary
     wire if_stall_req = (state_if == IF_NORMAL) && (pc[3:1] == 3'd7) && is_32bit_inst && i_icache_valid;
-    
-    wire [31:0] if_inst_raw = (state_if == IF_CROSS) ? {current_line[15:0], cross_word_lower} :
-                              (is_32bit_inst ? raw_inst : {16'b0, raw_inst[15:0]});
-                              
+    wire [31:0] if_inst_raw = (state_if == IF_CROSS) ? {current_line[15:0], cross_word_lower} : (is_32bit_inst ? raw_inst : {16'b0, raw_inst[15:0]});
     wire [31:0] expanded_inst;
-    RVC_EXPANDER rvc_exp(
-        .inst_in(if_inst_raw),
-        .inst_out(expanded_inst)
-    );
+    RVC_EXPANDER rvc_exp(.inst_in(if_inst_raw), .inst_out(expanded_inst));
 
     wire actual_is_32bit = (state_if == IF_CROSS) ? 1'b1 : is_32bit_inst;
     wire [31:0] pc_next_norm = pc + (actual_is_32bit ? 4 : 2);
-    wire actual_is_rvc = !actual_is_32bit;
-    
     wire [31:0] pc_next_pred = (predict_taken && !if_stall_req) ? predict_target : pc_next_norm;
 
-    wire mem_stall = i_icache_stall | i_dcache_stall | (EX_MEM_is_flush && !flush_done_reg);
-    wire global_stall = mem_stall;
-    wire front_stall = load_use_stall | if_stall_req;
-
     always @(posedge clk) begin
         if (!rst_n) begin
-            state_if <= IF_NORMAL;
-            cross_word_lower <= 16'b0;
-        end else begin
-            if (branch_taken) begin
-                state_if <= IF_NORMAL;
-            end else if (state_if == IF_NORMAL && if_stall_req && !mem_stall) begin
-                state_if <= IF_CROSS;
-                cross_word_lower <= raw_inst[15:0];
-            end else if (state_if == IF_CROSS && !global_stall && !front_stall) begin
-                state_if <= IF_NORMAL;
-            end
-        end
-    end
-
-    always @(posedge clk) begin
-        if (!rst_n) pc <= 32'b0;
-        else if (!global_stall) begin
-            if (branch_taken) pc <= correction_target;
-            else if (!front_stall) pc <= pc_next_pred;
-        end
-    end
-
-    always @(posedge clk) begin
-        if (!rst_n) begin
-            IF_ID_pc   <= 32'b0;
-            IF_ID_inst <= 32'h00000013;
-            IF_ID_is_rvc <= 0;
-            IF_ID_pred_taken  <= 0;
-            IF_ID_pred_target <= 32'b0;
+            state_if <= IF_NORMAL; cross_word_lower <= 16'b0;
+            pc <= 32'b0; IF_ID_pc <= 32'b0; IF_ID_inst <= 32'h00000013;
+            IF_ID_is_rvc <= 0; IF_ID_pred_taken <= 0; IF_ID_pred_target <= 32'b0;
         end else if (!global_stall) begin
             if (branch_taken) begin
-                IF_ID_pc   <= 32'b0;
-                IF_ID_inst <= 32'h00000013;
-                IF_ID_is_rvc <= 0;
-                IF_ID_pred_taken  <= 0;
-                IF_ID_pred_target <= 32'b0;
-            end else if (!front_stall) begin
-                IF_ID_pc   <= pc;
-                IF_ID_inst <= expanded_inst;
-                IF_ID_is_rvc <= actual_is_rvc;
-                IF_ID_pred_taken  <= predict_taken;
-                IF_ID_pred_target <= predict_target;
-                IF_ID_ghr         <= ghr;
+                state_if <= IF_NORMAL; pc <= correction_target;
+                IF_ID_inst <= 32'h00000013; IF_ID_is_rvc <= 0; IF_ID_pred_taken <= 0;
+            end else begin
+                if (state_if == IF_NORMAL && if_stall_req) begin
+                    state_if <= IF_CROSS; cross_word_lower <= raw_inst[15:0];
+                end else if (state_if == IF_CROSS && !front_stall) begin
+                    state_if <= IF_NORMAL;
+                end
+                if (!front_stall) begin
+                    pc <= pc_next_pred; IF_ID_pc <= pc; IF_ID_inst <= expanded_inst;
+                    IF_ID_is_rvc <= !actual_is_32bit; IF_ID_pred_taken <= predict_taken;
+                    IF_ID_pred_target <= predict_target; IF_ID_ghr <= ghr;
+                end
             end
         end
     end
@@ -278,26 +238,33 @@ module RISCV_CORE (
     // -------------------------------------------------------------------------
     // ID Stage
     // -------------------------------------------------------------------------
-    wire [6:0]  opcode = IF_ID_inst[6:0];
-    wire [2:0]  funct3 = IF_ID_inst[14:12];
-    wire [6:0]  funct7 = IF_ID_inst[31:25];
-    wire [4:0]  rs1    = IF_ID_inst[19:15];
-    wire [4:0]  rs2    = IF_ID_inst[24:20];
-    wire [4:0]  rd     = IF_ID_inst[11:7];
+    wire [6:0] opcode = IF_ID_inst[6:0];
+    wire [2:0] funct3 = IF_ID_inst[14:12];
+    wire [6:0] funct7 = IF_ID_inst[31:25];
+    wire [4:0] rs1 = IF_ID_inst[19:15];
+    wire [4:0] rs2 = IF_ID_inst[24:20];
+    wire [4:0] rd  = IF_ID_inst[11:7];
 
     reg [31:0] regs [0:31];
-
     wire [31:0] rs1_data = (rs1 == 5'b0) ? 32'b0 : (MEM_WB_reg_write && MEM_WB_rd == rs1) ? wb_data : regs[rs1];
     wire [31:0] rs2_data = (rs2 == 5'b0) ? 32'b0 : (MEM_WB_reg_write && MEM_WB_rd == rs2) ? wb_data : regs[rs2];
     
+    wire rs1_valid = (opcode == 7'b0110011) || (opcode == 7'b0010011) || (opcode == 7'b0000011) || 
+                     (opcode == 7'b0100011) || (opcode == 7'b1100011) || (opcode == 7'b1100111);
+    wire rs2_valid = (opcode == 7'b0110011) || (opcode == 7'b0100011) || (opcode == 7'b1100011);
+
+    assign load_use_stall = ((ID_EX_mem_read || ID_EX_is_mult) && ID_EX_rd != 0 &&
+                            ((rs1_valid && (ID_EX_rd == rs1)) || (rs2_valid && (ID_EX_rd == rs2))));
+    assign front_stall = load_use_stall | if_stall_req;
+
     reg [31:0] imm;
     always @(*) begin
         case(opcode)
-            7'b0010011, 7'b0000011, 7'b1100111: imm = {{20{IF_ID_inst[31]}}, IF_ID_inst[31:20]}; // I-Type
-            7'b0100011: imm = {{20{IF_ID_inst[31]}}, IF_ID_inst[31:25], IF_ID_inst[11:7]};       // S-Type
-            7'b1100011: imm = {{20{IF_ID_inst[31]}}, IF_ID_inst[7], IF_ID_inst[30:25], IF_ID_inst[11:8], 1'b0}; // B-Type
-            7'b1101111: imm = {{12{IF_ID_inst[31]}}, IF_ID_inst[19:12], IF_ID_inst[20], IF_ID_inst[30:21], 1'b0}; // J-Type
-            7'b0110111, 7'b0010111: imm = {IF_ID_inst[31:12], 12'b0}; // U-Type
+            7'b0010011, 7'b0000011, 7'b1100111: imm = {{20{IF_ID_inst[31]}}, IF_ID_inst[31:20]};
+            7'b0100011: imm = {{20{IF_ID_inst[31]}}, IF_ID_inst[31:25], IF_ID_inst[11:7]};
+            7'b1100011: imm = {{20{IF_ID_inst[31]}}, IF_ID_inst[7], IF_ID_inst[30:25], IF_ID_inst[11:8], 1'b0};
+            7'b1101111: imm = {{12{IF_ID_inst[31]}}, IF_ID_inst[19:12], IF_ID_inst[20], IF_ID_inst[30:21], 1'b0};
+            7'b0110111, 7'b0010111: imm = {IF_ID_inst[31:12], 12'b0};
             default: imm = 32'b0;
         endcase
     end
@@ -305,116 +272,80 @@ module RISCV_CORE (
     reg ctrl_reg_write, ctrl_mem_read, ctrl_mem_write, ctrl_alu_src, ctrl_mem_to_reg;
     reg ctrl_branch, ctrl_jump, ctrl_jalr, ctrl_pc_to_alu, ctrl_is_mult;
     reg [3:0] ctrl_alu_op; 
-
     wire is_flush = (IF_ID_inst == 32'h00202007);
 
     always @(*) begin
-        ctrl_reg_write = 0; ctrl_mem_read = 0; ctrl_mem_write = 0; 
-        ctrl_alu_src = 0; ctrl_mem_to_reg = 0; ctrl_branch = 0; 
-        ctrl_jump = 0; ctrl_jalr = 0; ctrl_alu_op = 4'b0000; ctrl_pc_to_alu = 0; ctrl_is_mult = 0;
+        ctrl_reg_write = 0; ctrl_mem_read = 0; ctrl_mem_write = 0; ctrl_alu_src = 0; 
+        ctrl_mem_to_reg = 0; ctrl_branch = 0; ctrl_jump = 0; ctrl_jalr = 0; 
+        ctrl_alu_op = 4'b0000; ctrl_pc_to_alu = 0; ctrl_is_mult = 0;
         case(opcode)
             7'b0110011: begin 
                 ctrl_reg_write = 1;
                 if(funct7 == 7'b0000000) begin
-                    if(funct3 == 3'b000) ctrl_alu_op = 4'd0;
-                    else if(funct3 == 3'b111) ctrl_alu_op = 4'd2;
-                    else if(funct3 == 3'b110) ctrl_alu_op = 4'd3;
-                    else if(funct3 == 3'b100) ctrl_alu_op = 4'd4;
-                    else if(funct3 == 3'b001) ctrl_alu_op = 4'd5;
-                    else if(funct3 == 3'b101) ctrl_alu_op = 4'd6;
-                    else if(funct3 == 3'b010) ctrl_alu_op = 4'd8;
+                    case(funct3)
+                        3'b000: ctrl_alu_op = 4'd0; 3'b111: ctrl_alu_op = 4'd2;
+                        3'b110: ctrl_alu_op = 4'd3; 3'b100: ctrl_alu_op = 4'd4;
+                        3'b001: ctrl_alu_op = 4'd5; 3'b101: ctrl_alu_op = 4'd6;
+                        3'b010: ctrl_alu_op = 4'd8;
+                    endcase
                 end else if (funct7 == 7'b0100000) begin
                     if(funct3 == 3'b000) ctrl_alu_op = 4'd1;
                     else if(funct3 == 3'b101) ctrl_alu_op = 4'd7;
                 end else if (funct7 == 7'b0000001) begin // M-Type
                     ctrl_is_mult = 1;
-                    if(funct3 == 3'b000) ctrl_alu_op = 4'd12; // MUL
-                    else if(funct3 == 3'b001) ctrl_alu_op = 4'd13; // MULH
-                    else if(funct3 == 3'b010) ctrl_alu_op = 4'd14; // MULHSU
-                    else if(funct3 == 3'b011) ctrl_alu_op = 4'd15; // MULHU
+                    case(funct3)
+                        3'b000: ctrl_alu_op = 4'd12; 3'b001: ctrl_alu_op = 4'd13;
+                        3'b010: ctrl_alu_op = 4'd14; 3'b011: ctrl_alu_op = 4'd15;
+                    endcase
                 end
             end
-            7'b0010011: begin // I-Type
-                ctrl_reg_write = 1; ctrl_alu_src = 1;
-                if(funct3 == 3'b000) ctrl_alu_op = 4'd0;
-                else if(funct3 == 3'b111) ctrl_alu_op = 4'd2;
-                else if(funct3 == 3'b110) ctrl_alu_op = 4'd3;
-                else if(funct3 == 3'b100) ctrl_alu_op = 4'd4;
-                else if(funct3 == 3'b001) ctrl_alu_op = 4'd5;
-                else if(funct3 == 3'b101 && funct7 == 7'b0000000) ctrl_alu_op = 4'd6;
-                else if(funct3 == 3'b101 && funct7 == 7'b0100000) ctrl_alu_op = 4'd7;
-                else if(funct3 == 3'b010) ctrl_alu_op = 4'd8;
+            7'b0010011: begin ctrl_reg_write = 1; ctrl_alu_src = 1;
+                case(funct3)
+                    3'b000: ctrl_alu_op = 4'd0; 3'b111: ctrl_alu_op = 4'd2;
+                    3'b110: ctrl_alu_op = 4'd3; 3'b100: ctrl_alu_op = 4'd4;
+                    3'b001: ctrl_alu_op = 4'd5; 3'b010: ctrl_alu_op = 4'd8;
+                    3'b101: ctrl_alu_op = (funct7 == 7'b0100000) ? 4'd7 : 4'd6;
+                endcase
             end
-            7'b0000011: begin // LW
-                ctrl_reg_write = 1; ctrl_alu_src = 1; ctrl_mem_read = 1; ctrl_mem_to_reg = 1; ctrl_alu_op = 4'd0;
-            end
-            7'b0100011: begin // SW
-                ctrl_alu_src = 1; ctrl_mem_write = 1; ctrl_alu_op = 4'd0;
-            end
-            7'b1100011: begin // Branch
-                ctrl_branch = 1;
-                if(funct3 == 3'b000) ctrl_alu_op = 4'd9;
-                else if(funct3 == 3'b001) ctrl_alu_op = 4'd10;
-            end
-            7'b1101111: begin // JAL
-                ctrl_jump = 1; ctrl_reg_write = 1;
-            end
-            7'b1100111: begin // JALR
-                ctrl_jalr = 1; ctrl_reg_write = 1; ctrl_alu_src = 1; ctrl_alu_op = 4'd0;
-            end
-            7'b0110111: begin // LUI
-                ctrl_reg_write = 1; ctrl_alu_src = 1; ctrl_alu_op = 4'd11; 
-            end
-            7'b0010111: begin // AUIPC
-                ctrl_reg_write = 1; ctrl_alu_src = 1; ctrl_alu_op = 4'd0; ctrl_pc_to_alu = 1;
-            end
+            7'b0000011: begin ctrl_reg_write = 1; ctrl_alu_src = 1; ctrl_mem_read = 1; ctrl_mem_to_reg = 1; end
+            7'b0100011: begin ctrl_alu_src = 1; ctrl_mem_write = 1; end
+            7'b1100011: begin ctrl_branch = 1; ctrl_alu_op = (funct3 == 3'b001) ? 4'd10 : 4'd9; end
+            7'b1101111: begin ctrl_jump = 1; ctrl_reg_write = 1; end
+            7'b1100111: begin ctrl_jalr = 1; ctrl_reg_write = 1; ctrl_alu_src = 1; end
+            7'b0110111: begin ctrl_reg_write = 1; ctrl_alu_src = 1; ctrl_alu_op = 4'd11; end
+            7'b0010111: begin ctrl_reg_write = 1; ctrl_alu_src = 1; ctrl_pc_to_alu = 1; end
         endcase
     end
 
-    wire rs1_valid = (opcode == 7'b0110011) || (opcode == 7'b0010011) || (opcode == 7'b0000011) || 
-                     (opcode == 7'b0100011) || (opcode == 7'b1100011) || (opcode == 7'b1100111);
-    wire rs2_valid = (opcode == 7'b0110011) || (opcode == 7'b0100011) || (opcode == 7'b1100011);
-
-    assign load_use_stall = (ID_EX_mem_read && ID_EX_rd != 0 &&
-                            ((rs1_valid && ID_EX_rd == rs1) || (rs2_valid && ID_EX_rd == rs2)));
+    // 🔥 終極優化：提前在 ID 階段算出下一個目標，省去 EX 階段加法器時間
+    wire [31:0] id_branch_target_calc = IF_ID_pc + imm;
+    wire [31:0] id_fallthrough_pc_calc = IF_ID_pc + (IF_ID_is_rvc ? 2 : 4);
 
     always @(posedge clk) begin
         if (!rst_n) begin
             ID_EX_reg_write <= 0; ID_EX_mem_read <= 0; ID_EX_mem_write <= 0;
-            ID_EX_branch <= 0; ID_EX_jump <= 0; ID_EX_jalr <= 0;
-            ID_EX_is_flush <= 0; ID_EX_rd <= 0; ID_EX_pc_to_alu <= 0;
-            ID_EX_is_mult <= 0; ID_EX_is_rvc <= 0;
+            ID_EX_branch <= 0; ID_EX_jump <= 0; ID_EX_jalr <= 0; ID_EX_is_flush <= 0;
+            ID_EX_rd <= 0; ID_EX_is_mult <= 0;
         end else if (!global_stall) begin
             if (branch_taken || front_stall) begin
                 ID_EX_reg_write <= 0; ID_EX_mem_read <= 0; ID_EX_mem_write <= 0;
-                ID_EX_branch <= 0; ID_EX_jump <= 0; ID_EX_jalr <= 0;
-                ID_EX_is_flush <= 0; ID_EX_rd <= 0; ID_EX_pc_to_alu <= 0;
-                ID_EX_is_mult <= 0; ID_EX_is_rvc <= 0;
-                ID_EX_pred_taken <= 0; ID_EX_pred_target <= 0;
+                ID_EX_branch <= 0; ID_EX_jump <= 0; ID_EX_jalr <= 0; ID_EX_is_flush <= 0;
+                ID_EX_is_mult <= 0; ID_EX_rd <= 0; 
             end else begin
-                ID_EX_pc       <= IF_ID_pc;
-                ID_EX_rs1_data <= rs1_data;
-                ID_EX_rs2_data <= rs2_data;
-                ID_EX_imm      <= imm;
-                ID_EX_rd       <= rd;
-                ID_EX_rs1      <= rs1;
-                ID_EX_rs2      <= rs2;
-                ID_EX_alu_op   <= ctrl_alu_op;
-                ID_EX_reg_write<= ctrl_reg_write;
-                ID_EX_mem_read <= ctrl_mem_read;
-                ID_EX_mem_write<= ctrl_mem_write;
-                ID_EX_alu_src  <= ctrl_alu_src;
-                ID_EX_mem_to_reg<= ctrl_mem_to_reg;
-                ID_EX_branch   <= ctrl_branch;
-                ID_EX_jump     <= ctrl_jump;
-                ID_EX_jalr     <= ctrl_jalr;
-                ID_EX_is_flush <= is_flush;
-                ID_EX_pc_to_alu<= ctrl_pc_to_alu;
-                ID_EX_is_mult  <= ctrl_is_mult;
-                ID_EX_is_rvc   <= IF_ID_is_rvc;
-                ID_EX_pred_taken <= IF_ID_pred_taken;
-                ID_EX_pred_target <= IF_ID_pred_target;
-                ID_EX_ghr      <= IF_ID_ghr;
+                ID_EX_pc <= IF_ID_pc; ID_EX_rs1_data <= rs1_data; ID_EX_rs2_data <= rs2_data;
+                ID_EX_imm <= imm; ID_EX_rd <= rd; ID_EX_rs1 <= rs1; ID_EX_rs2 <= rs2;
+                ID_EX_alu_op <= ctrl_alu_op; ID_EX_reg_write <= ctrl_reg_write;
+                ID_EX_mem_read <= ctrl_mem_read; ID_EX_mem_write <= ctrl_mem_write;
+                ID_EX_alu_src <= ctrl_alu_src; ID_EX_mem_to_reg <= ctrl_mem_to_reg;
+                ID_EX_branch <= ctrl_branch; ID_EX_jump <= ctrl_jump; ID_EX_jalr <= ctrl_jalr;
+                ID_EX_is_flush <= is_flush; ID_EX_pc_to_alu <= ctrl_pc_to_alu;
+                ID_EX_is_mult <= ctrl_is_mult; ID_EX_is_rvc <= IF_ID_is_rvc;
+                ID_EX_pred_taken <= IF_ID_pred_taken; ID_EX_pred_target <= IF_ID_pred_target;
+                ID_EX_ghr <= IF_ID_ghr;
+                
+                // 將提早算好的 Target 放進 Pipeline Register
+                ID_EX_branch_target <= id_branch_target_calc;
+                ID_EX_fallthrough_pc <= id_fallthrough_pc_calc;
             end
         end
     end
@@ -424,194 +355,139 @@ module RISCV_CORE (
     // -------------------------------------------------------------------------
     wire [1:0] forward_A = (EX_MEM_reg_write && EX_MEM_rd != 0 && EX_MEM_rd == ID_EX_rs1) ? 2'b10 :
                            (MEM_WB_reg_write && MEM_WB_rd != 0 && MEM_WB_rd == ID_EX_rs1) ? 2'b01 : 2'b00;
-                           
     wire [1:0] forward_B = (EX_MEM_reg_write && EX_MEM_rd != 0 && EX_MEM_rd == ID_EX_rs2) ? 2'b10 :
                            (MEM_WB_reg_write && MEM_WB_rd != 0 && MEM_WB_rd == ID_EX_rs2) ? 2'b01 : 2'b00;
 
-    wire [31:0] mul_mem_res = (EX_MEM_alu_op == 4'd12) ? EX_MEM_mult_res[31:0] : EX_MEM_mult_res[63:32];
-    wire [31:0] ex_mem_fwd_data = (EX_MEM_mem_read) ? dcache_rdata_swapped : (EX_MEM_is_mult ? mul_mem_res : EX_MEM_alu_out);
+    wire [31:0] ex_mem_fwd_data = EX_MEM_alu_out;
     
     wire [31:0] alu_in1_base = (forward_A == 2'b10) ? ex_mem_fwd_data : (forward_A == 2'b01) ? wb_data : ID_EX_rs1_data;
     wire [31:0] alu_in1 = (ID_EX_pc_to_alu) ? ID_EX_pc : alu_in1_base;
-    
     wire [31:0] fwd_in2 = (forward_B == 2'b10) ? ex_mem_fwd_data : (forward_B == 2'b01) ? wb_data : ID_EX_rs2_data;
     wire [31:0] alu_in2 = (ID_EX_alu_src) ? ID_EX_imm : fwd_in2;
 
     reg [31:0] alu_result;
-    reg        alu_zero;
     always @(*) begin
-        alu_zero = 0;
         case(ID_EX_alu_op)
-            4'd0: alu_result = alu_in1 + alu_in2;             
-            4'd1: alu_result = alu_in1 - alu_in2;             
-            4'd2: alu_result = alu_in1 & alu_in2;             
-            4'd3: alu_result = alu_in1 | alu_in2;             
-            4'd4: alu_result = alu_in1 ^ alu_in2;             
-            4'd5: alu_result = alu_in1 << alu_in2[4:0];       
-            4'd6: alu_result = alu_in1 >> alu_in2[4:0];       
-            4'd7: alu_result = $signed(alu_in1) >>> alu_in2[4:0]; 
-            4'd8: alu_result = ($signed(alu_in1) < $signed(alu_in2)) ? 32'd1 : 32'd0; 
-            4'd9:  begin alu_result = alu_in1 - alu_in2; alu_zero = (alu_result == 0); end 
-            4'd10: begin alu_result = alu_in1 - alu_in2; alu_zero = (alu_result != 0); end 
-            4'd11: alu_result = alu_in2; 
-            default: alu_result = 32'b0;
+            4'd0: alu_result = alu_in1 + alu_in2; 4'd1: alu_result = alu_in1 - alu_in2;
+            4'd2: alu_result = alu_in1 & alu_in2; 4'd3: alu_result = alu_in1 | alu_in2;
+            4'd4: alu_result = alu_in1 ^ alu_in2; 4'd5: alu_result = alu_in1 << alu_in2[4:0];
+            4'd6: alu_result = alu_in1 >> alu_in2[4:0]; 4'd7: alu_result = $signed(alu_in1) >>> alu_in2[4:0];
+            4'd8: alu_result = ($signed(alu_in1) < $signed(alu_in2)) ? 32'd1 : 32'd0;
+            4'd9: alu_result = alu_in1 - alu_in2; 
+            4'd10: alu_result = alu_in1 - alu_in2; 
+            4'd11: alu_result = alu_in2; default: alu_result = 32'b0;
         endcase
+    end
+
+    // 🔥 終極優化：專用分支比較器，徹底繞過龐大的 ALU 加解法器
+    wire branch_cmp_eq = (alu_in1 == alu_in2);
+    
+    reg actual_taken;
+    always @(*) begin
+        if (ID_EX_jump || ID_EX_jalr) actual_taken = 1'b1;
+        else if (ID_EX_branch) begin
+            if (ID_EX_alu_op == 4'd9) actual_taken = branch_cmp_eq;       // BEQ
+            else if (ID_EX_alu_op == 4'd10) actual_taken = !branch_cmp_eq; // BNE
+            else actual_taken = 1'b0;
+        end else actual_taken = 1'b0;
     end
 
     wire signed [32:0] a_ext = (ID_EX_alu_op == 4'd13 || ID_EX_alu_op == 4'd14) ? {alu_in1[31], alu_in1} : {1'b0, alu_in1};
     wire signed [32:0] b_ext = (ID_EX_alu_op == 4'd13) ? {alu_in2[31], alu_in2} : {1'b0, alu_in2};
-    wire signed [65:0] mul_tmp = a_ext * b_ext;
+    wire [65:0] dw_mul_product;
+    DW_mult_pipe #(
+        .a_width(33), .b_width(33), .num_stages(2), .stall_mode(1), .rst_mode(1)
+    ) u_dw_mult (
+        .clk(clk), .rst_n(rst_n), .en(~global_stall), .tc(1'b1),
+        .a(a_ext), .b(b_ext), .product(dw_mul_product)
+    );
+    wire [31:0] mul_mem_res = (EX_MEM_alu_op == 4'd12) ? dw_mul_product[31:0] : dw_mul_product[63:32];
 
-    assign branch_target = (ID_EX_jalr) ? ((alu_in1_base + ID_EX_imm) & ~32'd1) : (ID_EX_pc + ID_EX_imm);
-    wire actual_taken  = ID_EX_jump | ID_EX_jalr | (ID_EX_branch & alu_zero);
+    // 🔥 終極優化：直接使用 ID 階段算好的 branch_target，只有 JALR 才需要在 EX 階段加法
+    wire [31:0] branch_target = (ID_EX_jalr) ? ((alu_in1_base + ID_EX_imm) & ~32'd1) : ID_EX_branch_target;
     
-    // Correction PC if mispredicted
-    assign correction_target = (actual_taken) ? branch_target : (ID_EX_pc + (ID_EX_is_rvc ? 2 : 4));
-    
+    assign correction_target = (actual_taken) ? branch_target : ID_EX_fallthrough_pc;
     assign branch_taken = (ID_EX_branch || ID_EX_jump || ID_EX_jalr) && 
                           (actual_taken != ID_EX_pred_taken || (actual_taken && (branch_target != ID_EX_pred_target)));
-    
-    // We must use correction_target when branch_taken (misprediction) is high
-    wire [31:0] final_branch_target = correction_target;
-    
-    // Update PC logic in IF uses 'branch_target' wire. Let's rename it to final_branch_target in IF.
-    // I will change the assignment in the always block.
-    
-    // Update BTB & RSB
+
     wire [3:0] ex_btb_idx = ID_EX_pc[5:2];
     wire [9:0] ex_pht_idx = ID_EX_pc[11:2] ^ ID_EX_ghr;
-
-    wire ex_hit0 = btb_valid[ex_btb_idx][0] && (btb_tag[ex_btb_idx][0] == ID_EX_pc);
-    wire ex_hit1 = btb_valid[ex_btb_idx][1] && (btb_tag[ex_btb_idx][1] == ID_EX_pc);
-    wire ex_hit2 = btb_valid[ex_btb_idx][2] && (btb_tag[ex_btb_idx][2] == ID_EX_pc);
-    wire ex_hit3 = btb_valid[ex_btb_idx][3] && (btb_tag[ex_btb_idx][3] == ID_EX_pc);
-    wire ex_hit  = ex_hit0 || ex_hit1 || ex_hit2 || ex_hit3;
+    wire ex_hit0 = btb_val_0[ex_btb_idx] && (btb_tag_0[ex_btb_idx] == ID_EX_pc);
+    wire ex_hit1 = btb_val_1[ex_btb_idx] && (btb_tag_1[ex_btb_idx] == ID_EX_pc);
+    wire ex_hit2 = btb_val_2[ex_btb_idx] && (btb_tag_2[ex_btb_idx] == ID_EX_pc);
+    wire ex_hit3 = btb_val_3[ex_btb_idx] && (btb_tag_3[ex_btb_idx] == ID_EX_pc);
+    wire ex_hit = ex_hit0 || ex_hit1 || ex_hit2 || ex_hit3;
     wire [1:0] ex_hit_way = ex_hit0 ? 2'd0 : ex_hit1 ? 2'd1 : ex_hit2 ? 2'd2 : 2'd3;
-
-    // CALL: JAL/JALR with rd=1 or rd=5
-    // RET: JALR with rs1=1 or rs1=5 and rd=0
+    
     wire is_call = (ID_EX_jump || ID_EX_jalr) && (ID_EX_rd == 5'd1 || ID_EX_rd == 5'd5);
     wire is_ret  = ID_EX_jalr && (ID_EX_rs1 == 5'd1 || ID_EX_rs1 == 5'd5) && (ID_EX_rd == 5'd0);
 
-    integer j, w;
+    integer j;
     always @(posedge clk) begin
         if (!rst_n) begin
             for (j=0; j<16; j=j+1) begin
-                for (w=0; w<4; w=w+1) begin
-                    btb_valid[j][w]   <= 0;
-                    btb_is_call[j][w] <= 0;
-                    btb_is_ret[j][w]  <= 0;
-                end
+                btb_val_0[j] <= 0; btb_val_1[j] <= 0; btb_val_2[j] <= 0; btb_val_3[j] <= 0;
                 btb_plru[j] <= 0;
             end
-            for (j=0; j<1024; j=j+1) pht[j] <= 2'b01; 
-            for (j=0; j<8; j=j+1) rsb_stack[j] <= 0;
-            ghr <= 0;
-            rsb_ptr <= 0;
+            for (j=0; j<1024; j=j+1) pht[j] <= 2'b01;
+            ghr <= 0; rsb_ptr <= 0;
         end else if (!global_stall) begin
             if (ID_EX_branch || ID_EX_jump || ID_EX_jalr) begin
                 if (ID_EX_branch) begin
-                    if (actual_taken) begin
-                        if (pht[ex_pht_idx] != 2'd3) pht[ex_pht_idx] <= pht[ex_pht_idx] + 1;
-                    end else begin
-                        if (pht[ex_pht_idx] != 2'd0) pht[ex_pht_idx] <= pht[ex_pht_idx] - 1;
-                    end
+                    if (actual_taken) begin if (pht[ex_pht_idx] != 2'd3) pht[ex_pht_idx] <= pht[ex_pht_idx] + 1; end
+                    else begin if (pht[ex_pht_idx] != 2'd0) pht[ex_pht_idx] <= pht[ex_pht_idx] - 1; end
                     ghr <= {ghr[8:0], actual_taken};
                 end
-                if (ID_EX_jump || ID_EX_jalr || actual_taken) begin
-                    if (ex_hit) begin
-                        btb_target[ex_btb_idx][ex_hit_way] <= branch_target;
-                        btb_is_call[ex_btb_idx][ex_hit_way] <= is_call;
-                        btb_is_ret[ex_btb_idx][ex_hit_way]  <= is_ret;
-                        // Update PLRU
-                        if (ex_hit_way == 0) begin btb_plru[ex_btb_idx][0] <= 1; btb_plru[ex_btb_idx][1] <= 1; end
-                        else if (ex_hit_way == 1) begin btb_plru[ex_btb_idx][0] <= 1; btb_plru[ex_btb_idx][1] <= 0; end
-                        else if (ex_hit_way == 2) begin btb_plru[ex_btb_idx][0] <= 0; btb_plru[ex_btb_idx][2] <= 1; end
-                        else if (ex_hit_way == 3) begin btb_plru[ex_btb_idx][0] <= 0; btb_plru[ex_btb_idx][2] <= 0; end
-                    end else begin
-                        case ({btb_plru[ex_btb_idx][0], btb_plru[ex_btb_idx][1], btb_plru[ex_btb_idx][2]})
-                            3'b000, 3'b001: evict_way_btb_reg = 2'd0;
-                            3'b010, 3'b011: evict_way_btb_reg = 2'd1;
-                            3'b100, 3'b110: evict_way_btb_reg = 2'd2;
-                            3'b101, 3'b111: evict_way_btb_reg = 2'd3;
-                            default: evict_way_btb_reg = 2'd0;
-                        endcase
-                        btb_valid[ex_btb_idx][evict_way_btb_reg]   <= 1;
-                        btb_tag[ex_btb_idx][evict_way_btb_reg]     <= ID_EX_pc;
-                        btb_target[ex_btb_idx][evict_way_btb_reg]  <= branch_target;
-                        btb_is_call[ex_btb_idx][evict_way_btb_reg] <= is_call;
-                        btb_is_ret[ex_btb_idx][evict_way_btb_reg]  <= is_ret;
-                        // Update PLRU
-                        if (evict_way_btb_reg == 0) begin btb_plru[ex_btb_idx][0] <= 1; btb_plru[ex_btb_idx][1] <= 1; end
-                        else if (evict_way_btb_reg == 1) begin btb_plru[ex_btb_idx][0] <= 1; btb_plru[ex_btb_idx][1] <= 0; end
-                        else if (evict_way_btb_reg == 2) begin btb_plru[ex_btb_idx][0] <= 0; btb_plru[ex_btb_idx][2] <= 1; end
-                        else if (evict_way_btb_reg == 3) begin btb_plru[ex_btb_idx][0] <= 0; btb_plru[ex_btb_idx][2] <= 0; end
-                    end
+                if (ex_hit) begin
+                    if (ex_hit_way == 2'd0) btb_tgt_0[ex_btb_idx] <= branch_target;
+                    else if (ex_hit_way == 2'd1) btb_tgt_1[ex_btb_idx] <= branch_target;
+                    else if (ex_hit_way == 2'd2) btb_tgt_2[ex_btb_idx] <= branch_target;
+                    else btb_tgt_3[ex_btb_idx] <= branch_target;
                 end
-                // RSB Operation
-                if (is_call) begin
-                    rsb_stack[rsb_ptr] <= ID_EX_pc + (ID_EX_is_rvc ? 2 : 4);
-                    rsb_ptr <= rsb_ptr + 1;
-                end else if (is_ret) begin
-                    rsb_ptr <= rsb_ptr - 1;
-                end
+                if (is_call) begin rsb_stack[rsb_ptr] <= ID_EX_pc + (ID_EX_is_rvc ? 2 : 4); rsb_ptr <= rsb_ptr + 1; end
+                else if (is_ret) rsb_ptr <= rsb_ptr - 1;
             end
         end
     end
 
     always @(posedge clk) begin
         if (!rst_n) begin
-            EX_MEM_reg_write <= 0; EX_MEM_mem_read <= 0; EX_MEM_mem_write <= 0; EX_MEM_is_flush <= 0;
-            EX_MEM_rd <= 0; EX_MEM_is_mult <= 0;
+            EX_MEM_reg_write <= 0; EX_MEM_mem_read <= 0; EX_MEM_mem_write <= 0; 
+            EX_MEM_is_flush <= 0; EX_MEM_rd <= 0; EX_MEM_is_mult <= 0;
         end else if (!global_stall) begin
-            EX_MEM_reg_write <= ID_EX_reg_write;
-            EX_MEM_mem_read  <= ID_EX_mem_read;
-            EX_MEM_mem_write <= ID_EX_mem_write;
-            EX_MEM_mem_to_reg<= ID_EX_mem_to_reg;
-            EX_MEM_rd        <= ID_EX_rd;
-            EX_MEM_alu_op    <= ID_EX_alu_op;
-            EX_MEM_alu_out   <= (ID_EX_jump || ID_EX_jalr) ? (ID_EX_pc + (ID_EX_is_rvc ? 2 : 4)) : alu_result;
-            EX_MEM_rs2_data  <= fwd_in2;
-            EX_MEM_is_flush  <= ID_EX_is_flush;
-            EX_MEM_is_mult   <= ID_EX_is_mult;
-            EX_MEM_mult_res  <= mul_tmp[63:0];
+            EX_MEM_reg_write <= ID_EX_reg_write; EX_MEM_mem_read <= ID_EX_mem_read;
+            EX_MEM_mem_write <= ID_EX_mem_write; EX_MEM_mem_to_reg <= ID_EX_mem_to_reg;
+            EX_MEM_rd <= ID_EX_rd; EX_MEM_alu_op <= ID_EX_alu_op;
+            EX_MEM_alu_out <= (ID_EX_jump || ID_EX_jalr) ? (ID_EX_pc + (ID_EX_is_rvc ? 2 : 4)) : alu_result;
+            EX_MEM_rs2_data <= fwd_in2; EX_MEM_is_flush <= ID_EX_is_flush; EX_MEM_is_mult <= ID_EX_is_mult;
         end
     end
 
     // -------------------------------------------------------------------------
-    // MEM Stage
+    // MEM & WB Stage
     // -------------------------------------------------------------------------
-    assign o_dcache_ren   = EX_MEM_mem_read;
-    assign o_dcache_wen   = EX_MEM_mem_write;
-    assign o_dcache_addr  = EX_MEM_alu_out;
-    
+    assign o_dcache_ren = EX_MEM_mem_read;
+    assign o_dcache_wen = EX_MEM_mem_write;
+    assign o_dcache_addr = EX_MEM_alu_out;
     assign o_dcache_wdata = {EX_MEM_rs2_data[7:0], EX_MEM_rs2_data[15:8], EX_MEM_rs2_data[23:16], EX_MEM_rs2_data[31:24]};
 
     always @(posedge clk) begin
-        if (!rst_n) begin
-            MEM_WB_reg_write <= 0; MEM_WB_rd <= 0;
-        end else if (!global_stall) begin
-            MEM_WB_reg_write <= EX_MEM_reg_write;
-            MEM_WB_mem_to_reg<= EX_MEM_mem_to_reg;
-            MEM_WB_rd        <= EX_MEM_rd;
-            MEM_WB_alu_out   <= EX_MEM_is_mult ? mul_mem_res : EX_MEM_alu_out;
-            MEM_WB_mem_rdata <= dcache_rdata_swapped;
+        if (!rst_n) begin MEM_WB_reg_write <= 0; MEM_WB_rd <= 0; end
+        else if (!global_stall) begin
+            MEM_WB_reg_write <= EX_MEM_reg_write; MEM_WB_mem_to_reg <= EX_MEM_mem_to_reg;
+            MEM_WB_rd <= EX_MEM_rd; MEM_WB_mem_rdata <= dcache_rdata_swapped;
+            MEM_WB_alu_out <= EX_MEM_is_mult ? mul_mem_res : EX_MEM_alu_out;
         end
     end
 
-    // -------------------------------------------------------------------------
-    // WB Stage
-    // -------------------------------------------------------------------------
     integer i;
     always @(posedge clk) begin
-        if (!rst_n) begin
-            for(i=0; i<32; i=i+1) regs[i] <= 32'b0;
-        end else if (MEM_WB_reg_write && MEM_WB_rd != 5'b0) begin
-            regs[MEM_WB_rd] <= wb_data;
-        end
+        if (!rst_n) for(i=0; i<32; i=i+1) regs[i] <= 32'b0;
+        else if (MEM_WB_reg_write && MEM_WB_rd != 5'b0) regs[MEM_WB_rd] <= wb_data;
     end
-
 endmodule
+
+// (後面的 RVC_EXPANDER, ICACHE, DCACHE 完全維持先前的平坦化版本，直接貼上即可)
 
 module RVC_EXPANDER(
     input  [31:0] inst_in,
