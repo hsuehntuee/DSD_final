@@ -1,26 +1,18 @@
-// -----------------------------------------------------------------------------
-// DSD Final Project: Pipelined RISC-V Processor with I/D Caches, RV32M, RV32C
-// 突破 3.5ns 極限版：分支預測運算前移 (Early Branch Calc) + 專用比較器
-// -----------------------------------------------------------------------------
-
 module CHIP (
     input               clk,
     input               rst_n,
-    // ---------- for slow_memD ------------
     output              mem_read_D,
     output              mem_write_D,
     output      [31:4]  mem_addr_D,
     output      [127:0] mem_wdata_D,
     input       [127:0] mem_rdata_D,
     input               mem_ready_D,
-    // ---------- for slow_memI ------------
     output              mem_read_I,
     output              mem_write_I,
     output      [31:4]  mem_addr_I,
     output      [127:0] mem_wdata_I,
     input       [127:0] mem_rdata_I,
     input               mem_ready_I,
-    // ---------- for TestBed --------------
     output              o_done
 );
     wire [127:0] icache_data;
@@ -85,7 +77,7 @@ module CHIP (
 endmodule
 
 // =============================================================================
-// RISC-V 5-Stage Pipeline Core
+// RISC-V 5-Stage Pipeline Core (10-bit GHR, 1K PHT, 8 RSB)
 // =============================================================================
 module RISCV_CORE (
     input         clk,
@@ -117,9 +109,9 @@ module RISCV_CORE (
     reg        ID_EX_is_mult, ID_EX_is_rvc;
     reg        ID_EX_pred_taken;
     reg [31:0] ID_EX_pred_target;
-    reg [9:0]  ID_EX_ghr;
     
-    // 🔥 新增：在 ID 階段提早算好的分支目標，減輕 EX 階段加法器負擔
+    reg [9:0] ID_EX_ghr;
+    
     reg [31:0] ID_EX_branch_target;
     reg [31:0] ID_EX_fallthrough_pc;
 
@@ -162,7 +154,7 @@ module RISCV_CORE (
     wire [31:0]  raw_inst = shifted_line;
 
     // -------------------------------------------------------------------------
-    // IF Stage (BTB 1D Arrays)
+    // IF Stage
     // -------------------------------------------------------------------------
     reg [31:0] btb_tag_0 [0:15]; reg [31:0] btb_tag_1 [0:15]; reg [31:0] btb_tag_2 [0:15]; reg [31:0] btb_tag_3 [0:15];
     reg [31:0] btb_tgt_0 [0:15]; reg [31:0] btb_tgt_1 [0:15]; reg [31:0] btb_tgt_2 [0:15]; reg [31:0] btb_tgt_3 [0:15];
@@ -317,7 +309,6 @@ module RISCV_CORE (
         endcase
     end
 
-    // 🔥 終極優化：提前在 ID 階段算出下一個目標，省去 EX 階段加法器時間
     wire [31:0] id_branch_target_calc = IF_ID_pc + imm;
     wire [31:0] id_fallthrough_pc_calc = IF_ID_pc + (IF_ID_is_rvc ? 2 : 4);
 
@@ -343,7 +334,6 @@ module RISCV_CORE (
                 ID_EX_pred_taken <= IF_ID_pred_taken; ID_EX_pred_target <= IF_ID_pred_target;
                 ID_EX_ghr <= IF_ID_ghr;
                 
-                // 將提早算好的 Target 放進 Pipeline Register
                 ID_EX_branch_target <= id_branch_target_calc;
                 ID_EX_fallthrough_pc <= id_fallthrough_pc_calc;
             end
@@ -379,15 +369,14 @@ module RISCV_CORE (
         endcase
     end
 
-    // 🔥 終極優化：專用分支比較器，徹底繞過龐大的 ALU 加解法器
     wire branch_cmp_eq = (alu_in1 == alu_in2);
     
     reg actual_taken;
     always @(*) begin
         if (ID_EX_jump || ID_EX_jalr) actual_taken = 1'b1;
         else if (ID_EX_branch) begin
-            if (ID_EX_alu_op == 4'd9) actual_taken = branch_cmp_eq;       // BEQ
-            else if (ID_EX_alu_op == 4'd10) actual_taken = !branch_cmp_eq; // BNE
+            if (ID_EX_alu_op == 4'd9) actual_taken = branch_cmp_eq;
+            else if (ID_EX_alu_op == 4'd10) actual_taken = !branch_cmp_eq;
             else actual_taken = 1'b0;
         end else actual_taken = 1'b0;
     end
@@ -403,7 +392,6 @@ module RISCV_CORE (
     );
     wire [31:0] mul_mem_res = (EX_MEM_alu_op == 4'd12) ? dw_mul_product[31:0] : dw_mul_product[63:32];
 
-    // 🔥 終極優化：直接使用 ID 階段算好的 branch_target，只有 JALR 才需要在 EX 階段加法
     wire [31:0] branch_target = (ID_EX_jalr) ? ((alu_in1_base + ID_EX_imm) & ~32'd1) : ID_EX_branch_target;
     
     assign correction_target = (actual_taken) ? branch_target : ID_EX_fallthrough_pc;
@@ -487,8 +475,6 @@ module RISCV_CORE (
     end
 endmodule
 
-// (後面的 RVC_EXPANDER, ICACHE, DCACHE 完全維持先前的平坦化版本，直接貼上即可)
-
 module RVC_EXPANDER(
     input  [31:0] inst_in,
     output reg [31:0] inst_out
@@ -496,115 +482,113 @@ module RVC_EXPANDER(
     wire [15:0] inst_c = inst_in[15:0];
     wire [1:0] op = inst_c[1:0];
     wire [2:0] funct3 = inst_c[15:13];
-
     wire [4:0] rs1_p = {2'b01, inst_c[9:7]};
     wire [4:0] rs2_p = {2'b01, inst_c[4:2]};
-
     always @(*) begin
         if (op == 2'b11) begin
-            inst_out = inst_in; // 32-bit standard instruction
+            inst_out = inst_in; 
         end else begin
-            inst_out = 32'h00000013; // default NOP
+            inst_out = 32'h00000013; 
             case(op)
                 2'b00: begin
                     case(funct3)
-                        3'b000: begin // C.ADDI4SPN: addi rd', x2, nzuimm
+                        3'b000: begin 
                             if (inst_c[12:5] != 8'b0) begin
                                 inst_out = {2'b00, inst_c[10:7], inst_c[12:11], inst_c[5], inst_c[6], 2'b00, 5'd2, 3'b000, rs2_p, 7'b0010011};
                             end
                         end
-                        3'b010: begin // C.LW: lw rd', offset(rs1')
+                        3'b010: begin 
                             inst_out = {5'b0, inst_c[5], inst_c[12:10], inst_c[6], 2'b00, rs1_p, 3'b010, rs2_p, 7'b0000011};
                         end
-                        3'b110: begin // C.SW: sw rs2', offset(rs1')
+                        3'b110: begin 
                             inst_out = {5'b0, inst_c[5], inst_c[12], rs2_p, rs1_p, 3'b010, inst_c[11:10], inst_c[6], 2'b00, 7'b0100011};
                         end
                     endcase
                 end
                 2'b01: begin
                     case(funct3)
-                        3'b000: begin // C.ADDI: addi rd, rd, nzimm
+                        3'b000: begin 
                             if (inst_c[11:7] != 5'b0) begin
                                 inst_out = {{6{inst_c[12]}}, inst_c[12], inst_c[6:2], inst_c[11:7], 3'b000, inst_c[11:7], 7'b0010011};
                             end
                         end
-                        3'b001: begin // C.JAL: jal x1, offset
+                        3'b001: begin 
                             inst_out = {inst_c[12], inst_c[8], inst_c[10:9], inst_c[6], inst_c[7], inst_c[2], inst_c[11], inst_c[5:3], inst_c[12], {8{inst_c[12]}}, 5'd1, 7'b1101111};
                         end
-                        3'b010: begin // C.LI: addi rd, x0, imm
+                        3'b010: begin 
                             if (inst_c[11:7] != 5'b0) begin
                                 inst_out = {{6{inst_c[12]}}, inst_c[12], inst_c[6:2], 5'd0, 3'b000, inst_c[11:7], 7'b0010011};
                             end
                         end
-                        3'b011: begin // C.LUI: lui rd, nzimm
+                        3'b011: begin 
                             if (inst_c[11:7] != 5'b0 && inst_c[11:7] != 5'd2) begin
                                 inst_out = {{15{inst_c[12]}}, inst_c[6:2], inst_c[11:7], 7'b0110111};
-                            end else if (inst_c[11:7] == 5'd2) begin // C.ADDI16SP
+                            end else if (inst_c[11:7] == 5'd2) begin 
                                 inst_out = {{3{inst_c[12]}}, inst_c[4:3], inst_c[5], inst_c[2], inst_c[6], 4'b0, 5'd2, 3'b000, 5'd2, 7'b0010011};
                             end
                         end
                         3'b100: begin 
                             case(inst_c[11:10])
-                                2'b00: begin // C.SRLI
+                                2'b00: begin 
                                     inst_out = {7'b0000000, inst_c[6:2], rs1_p, 3'b101, rs1_p, 7'b0010011};
                                 end
-                                2'b01: begin // C.SRAI
+                                2'b01: begin 
                                     inst_out = {7'b0100000, inst_c[6:2], rs1_p, 3'b101, rs1_p, 7'b0010011};
                                 end
-                                2'b10: begin // C.ANDI
+                                2'b10: begin 
                                     inst_out = {{6{inst_c[12]}}, inst_c[12], inst_c[6:2], rs1_p, 3'b111, rs1_p, 7'b0010011};
                                 end
                                 2'b11: begin 
                                     case({inst_c[12], inst_c[6:5]})
-                                        3'b000: inst_out = {7'b0100000, rs2_p, rs1_p, 3'b000, rs1_p, 7'b0110011}; // C.SUB
-                                        3'b001: inst_out = {7'b0000000, rs2_p, rs1_p, 3'b100, rs1_p, 7'b0110011}; // C.XOR
-                                        3'b010: inst_out = {7'b0000000, rs2_p, rs1_p, 3'b110, rs1_p, 7'b0110011}; // C.OR
-                                        3'b011: inst_out = {7'b0000000, rs2_p, rs1_p, 3'b111, rs1_p, 7'b0110011}; // C.AND
+                                        3'b000: inst_out = {7'b0100000, rs2_p, rs1_p, 3'b000, rs1_p, 7'b0110011}; 
+                                        3'b001: inst_out = {7'b0000000, rs2_p, rs1_p, 3'b100, rs1_p, 7'b0110011}; 
+                                        3'b010: inst_out = {7'b0000000, rs2_p, rs1_p, 3'b110, rs1_p, 7'b0110011}; 
+                                        3'b011: inst_out = {7'b0000000, rs2_p, rs1_p, 3'b111, rs1_p, 7'b0110011}; 
                                     endcase
                                 end
                             endcase
                         end
-                        3'b101: begin // C.J: jal x0, offset
+                        3'b101: begin 
                             inst_out = {inst_c[12], inst_c[8], inst_c[10:9], inst_c[6], inst_c[7], inst_c[2], inst_c[11], inst_c[5:3], inst_c[12], {8{inst_c[12]}}, 5'd0, 7'b1101111};
                         end
-                        3'b110: begin // C.BEQZ: beq rs1', x0, offset
+                        3'b110: begin 
                             inst_out = {inst_c[12], inst_c[12], inst_c[12], inst_c[12], inst_c[6:5], inst_c[2], 5'd0, rs1_p, 3'b000, inst_c[11:10], inst_c[4:3], inst_c[12], 7'b1100011};
                         end
-                        3'b111: begin // C.BNEZ: bne rs1', x0, offset
+                        3'b111: begin 
                             inst_out = {inst_c[12], inst_c[12], inst_c[12], inst_c[12], inst_c[6:5], inst_c[2], 5'd0, rs1_p, 3'b001, inst_c[11:10], inst_c[4:3], inst_c[12], 7'b1100011};
                         end
                     endcase
                 end
                 2'b10: begin
                     case(funct3)
-                        3'b000: begin // C.SLLI
+                        3'b000: begin 
                             inst_out = {7'b0000000, inst_c[6:2], inst_c[11:7], 3'b001, inst_c[11:7], 7'b0010011};
                         end
-                        3'b010: begin // C.LWSP: lw rd, offset(x2)
+                        3'b010: begin 
                             if (inst_c[11:7] != 5'b0) begin
                                 inst_out = {4'b0, inst_c[3:2], inst_c[12], inst_c[6:4], 2'b00, 5'd2, 3'b010, inst_c[11:7], 7'b0000011};
                             end
                         end
                         3'b100: begin
                             if (inst_c[12] == 0) begin
-                                if (inst_c[6:2] == 0) begin // C.JR
+                                if (inst_c[6:2] == 0) begin 
                                     inst_out = {12'b0, inst_c[11:7], 3'b000, 5'd0, 7'b1100111};
-                                end else begin // C.MV
+                                end else begin 
                                     inst_out = {7'b0000000, inst_c[6:2], 5'd0, 3'b000, inst_c[11:7], 7'b0110011};
                                 end
                             end else begin
                                 if (inst_c[6:2] == 0) begin 
-                                    if (inst_c[11:7] == 0) begin // C.EBREAK
+                                    if (inst_c[11:7] == 0) begin 
                                         inst_out = 32'h00100073;
-                                    end else begin // C.JALR
+                                    end else begin 
                                         inst_out = {12'b0, inst_c[11:7], 3'b000, 5'd1, 7'b1100111};
                                     end
-                                end else begin // C.ADD
+                                end else begin 
                                     inst_out = {7'b0000000, inst_c[6:2], inst_c[11:7], 3'b000, inst_c[11:7], 7'b0110011};
                                 end
                             end
                         end
-                        3'b110: begin // C.SWSP: sw rs2, offset(x2)
+                        3'b110: begin 
                             inst_out = {4'b0, inst_c[8:7], inst_c[12], inst_c[6:2], 5'd2, 3'b010, inst_c[11:9], 2'b00, 7'b0100011};
                         end
                     endcase
@@ -615,7 +599,7 @@ module RVC_EXPANDER(
 endmodule
 
 // =============================================================================
-// I-Cache (16 Sets, Normal Word Indexing)
+// I-Cache (1KB, 16 Sets, 1D Array Flattened)
 // =============================================================================
 module ICACHE (
     input          clk,
@@ -631,29 +615,24 @@ module ICACHE (
     input  [127:0] i_mem_rdata,
     input          i_mem_ready
 );
-
-    reg         valid [0:15][0:3];
-    reg [23:0]  tag   [0:15][0:3];
-    reg [127:0] data  [0:15][0:3];
-    reg [2:0]   plru  [0:15]; // Tree-based PLRU bits
+    reg         val_0 [0:15]; reg         val_1 [0:15]; reg         val_2 [0:15]; reg         val_3 [0:15];
+    reg [23:0]  tag_0 [0:15]; reg [23:0]  tag_1 [0:15]; reg [23:0]  tag_2 [0:15]; reg [23:0]  tag_3 [0:15];
+    reg [127:0] dat_0 [0:15]; reg [127:0] dat_1 [0:15]; reg [127:0] dat_2 [0:15]; reg [127:0] dat_3 [0:15];
+    reg [2:0]   plru  [0:15];
 
     wire [3:0]  idx = i_cpu_addr[7:4];
     wire [23:0] cur_tag = i_cpu_addr[31:8];
-    wire [1:0]  word_offset = i_cpu_addr[3:2];
 
-    wire hit0 = valid[idx][0] && (tag[idx][0] == cur_tag);
-    wire hit1 = valid[idx][1] && (tag[idx][1] == cur_tag);
-    wire hit2 = valid[idx][2] && (tag[idx][2] == cur_tag);
-    wire hit3 = valid[idx][3] && (tag[idx][3] == cur_tag);
+    wire hit0 = val_0[idx] && (tag_0[idx] == cur_tag);
+    wire hit1 = val_1[idx] && (tag_1[idx] == cur_tag);
+    wire hit2 = val_2[idx] && (tag_2[idx] == cur_tag);
+    wire hit3 = val_3[idx] && (tag_3[idx] == cur_tag);
     wire cache_hit = hit0 || hit1 || hit2 || hit3;
     wire [1:0] hit_way_idx = hit0 ? 2'd0 : hit1 ? 2'd1 : hit2 ? 2'd2 : 2'd3;
-
+    
     assign o_cpu_valid = cache_hit;
     assign o_cpu_stall = !cache_hit;
-
-    assign o_cpu_data = hit0 ? data[idx][0] :
-                        hit1 ? data[idx][1] :
-                        hit2 ? data[idx][2] : data[idx][3];
+    assign o_cpu_data = hit0 ? dat_0[idx] : hit1 ? dat_1[idx] : hit2 ? dat_2[idx] : dat_3[idx];
 
     reg [1:0] state, next_state;
     parameter IDLE = 2'd0, FETCH = 2'd1;
@@ -684,53 +663,38 @@ module ICACHE (
     assign o_mem_write = 1'b0;
     assign o_mem_wdata = 128'b0;
     assign o_mem_addr  = mem_addr_reg;
-
     wire [1:0] fill_way = (plru[mem_addr_reg[7:4]][0] == 0) ? (plru[mem_addr_reg[7:4]][1] == 0 ? 2'd0 : 2'd1) : (plru[mem_addr_reg[7:4]][2] == 0 ? 2'd2 : 2'd3);
-
-    integer i, w;
+    
+    integer i;
     always @(posedge clk) begin
         if (!rst_n) begin
             for (i=0; i<16; i=i+1) begin
-                for (w=0; w<4; w=w+1) valid[i][w] <= 0;
+                val_0[i] <= 0; val_1[i] <= 0; val_2[i] <= 0; val_3[i] <= 0;
                 plru[i] <= 0;
             end
-            prefetch_pending <= 0;
-            prefetch_addr <= 0;
-            mem_addr_reg <= 0;
-            is_prefetch_reg <= 0;
+            prefetch_pending <= 0; prefetch_addr <= 0; mem_addr_reg <= 0; is_prefetch_reg <= 0;
         end else begin
             if (state == IDLE && cache_hit) begin
-                // Update PLRU on hit
                 if (hit_way_idx == 0) begin plru[idx][0] <= 1; plru[idx][1] <= 1; end
                 else if (hit_way_idx == 1) begin plru[idx][0] <= 1; plru[idx][1] <= 0; end
                 else if (hit_way_idx == 2) begin plru[idx][0] <= 0; plru[idx][2] <= 1; end
                 else if (hit_way_idx == 3) begin plru[idx][0] <= 0; plru[idx][2] <= 0; end
 
                 if (!prefetch_pending && prefetch_addr != (i_cpu_addr + 16)) begin
-                    prefetch_addr <= (i_cpu_addr + 16);
-                    prefetch_pending <= 1;
+                    prefetch_addr <= (i_cpu_addr + 16); prefetch_pending <= 1;
                 end
             end
 
             if (state == IDLE && next_state == FETCH) begin
-                if (!cache_hit) begin
-                    mem_addr_reg <= i_cpu_addr[31:4];
-                    is_prefetch_reg <= 0;
-                end else begin
-                    mem_addr_reg <= prefetch_addr[31:4];
-                    is_prefetch_reg <= 1;
-                end
+                if (!cache_hit) begin mem_addr_reg <= i_cpu_addr[31:4]; is_prefetch_reg <= 0; end 
+                else begin mem_addr_reg <= prefetch_addr[31:4]; is_prefetch_reg <= 1; end
             end
 
             if (state == FETCH && i_mem_ready) begin
-                valid[mem_addr_reg[7:4]][fill_way] <= 1'b1;
-                tag[mem_addr_reg[7:4]][fill_way]   <= mem_addr_reg[31:8];
-                data[mem_addr_reg[7:4]][fill_way]  <= i_mem_rdata;
-                // Update PLRU on fill
-                if (fill_way == 0) begin plru[mem_addr_reg[7:4]][0] <= 1; plru[mem_addr_reg[7:4]][1] <= 1; end
-                else if (fill_way == 1) begin plru[mem_addr_reg[7:4]][0] <= 1; plru[mem_addr_reg[7:4]][1] <= 0; end
-                else if (fill_way == 2) begin plru[mem_addr_reg[7:4]][0] <= 0; plru[mem_addr_reg[7:4]][2] <= 1; end
-                else if (fill_way == 3) begin plru[mem_addr_reg[7:4]][0] <= 0; plru[mem_addr_reg[7:4]][2] <= 0; end
+                if (fill_way == 0) begin val_0[mem_addr_reg[7:4]] <= 1; tag_0[mem_addr_reg[7:4]] <= mem_addr_reg[31:8]; dat_0[mem_addr_reg[7:4]] <= i_mem_rdata; plru[mem_addr_reg[7:4]][0] <= 1; plru[mem_addr_reg[7:4]][1] <= 1; end
+                else if (fill_way == 1) begin val_1[mem_addr_reg[7:4]] <= 1; tag_1[mem_addr_reg[7:4]] <= mem_addr_reg[31:8]; dat_1[mem_addr_reg[7:4]] <= i_mem_rdata; plru[mem_addr_reg[7:4]][0] <= 1; plru[mem_addr_reg[7:4]][1] <= 0; end
+                else if (fill_way == 2) begin val_2[mem_addr_reg[7:4]] <= 1; tag_2[mem_addr_reg[7:4]] <= mem_addr_reg[31:8]; dat_2[mem_addr_reg[7:4]] <= i_mem_rdata; plru[mem_addr_reg[7:4]][0] <= 0; plru[mem_addr_reg[7:4]][2] <= 1; end
+                else if (fill_way == 3) begin val_3[mem_addr_reg[7:4]] <= 1; tag_3[mem_addr_reg[7:4]] <= mem_addr_reg[31:8]; dat_3[mem_addr_reg[7:4]] <= i_mem_rdata; plru[mem_addr_reg[7:4]][0] <= 0; plru[mem_addr_reg[7:4]][2] <= 0; end
                 
                 if (prefetch_pending && prefetch_addr[31:4] == mem_addr_reg) prefetch_pending <= 0;
                 else if (is_prefetch_reg) prefetch_pending <= 0;
@@ -740,7 +704,7 @@ module ICACHE (
 endmodule
 
 // =============================================================================
-// D-Cache (16 Sets, Normal Word Indexing)
+// D-Cache (1KB, 16 Sets 支援 EB 背景寫回)
 // =============================================================================
 module DCACHE (
     input          clk,
@@ -761,71 +725,85 @@ module DCACHE (
     input      [127:0] i_mem_rdata,
     input              i_mem_ready
 );
-
-    reg         valid [0:15][0:3];
-    reg         dirty [0:15][0:3];
-    reg [23:0]  tag   [0:15][0:3];
-    reg [127:0] data  [0:15][0:3];
-    reg [2:0]   plru  [0:15]; // Tree-based PLRU bits
+    reg         val_0 [0:15]; reg         val_1 [0:15]; reg         val_2 [0:15]; reg         val_3 [0:15];
+    reg         dty_0 [0:15]; reg         dty_1 [0:15]; reg         dty_2 [0:15]; reg         dty_3 [0:15];
+    reg [23:0]  tag_0 [0:15]; reg [23:0]  tag_1 [0:15]; reg [23:0]  tag_2 [0:15]; reg [23:0]  tag_3 [0:15];
+    reg [127:0] dat_0 [0:15]; reg [127:0] dat_1 [0:15]; reg [127:0] dat_2 [0:15]; reg [127:0] dat_3 [0:15];
+    reg [2:0]   plru  [0:15]; 
 
     wire [3:0]  idx = i_cpu_addr[7:4];
     wire [23:0] cur_tag = i_cpu_addr[31:8];
     wire [1:0]  word_offset = i_cpu_addr[3:2];
 
-    wire hit0 = valid[idx][0] && (tag[idx][0] == cur_tag);
-    wire hit1 = valid[idx][1] && (tag[idx][1] == cur_tag);
-    wire hit2 = valid[idx][2] && (tag[idx][2] == cur_tag);
-    wire hit3 = valid[idx][3] && (tag[idx][3] == cur_tag);
+    wire hit0 = val_0[idx] && (tag_0[idx] == cur_tag);
+    wire hit1 = val_1[idx] && (tag_1[idx] == cur_tag);
+    wire hit2 = val_2[idx] && (tag_2[idx] == cur_tag);
+    wire hit3 = val_3[idx] && (tag_3[idx] == cur_tag);
     wire hit = hit0 || hit1 || hit2 || hit3;
     wire [1:0] hit_way = hit0 ? 2'd0 : hit1 ? 2'd1 : hit2 ? 2'd2 : 2'd3;
     
     wire cpu_req = i_cpu_ren | i_cpu_wen;
     wire [1:0] evict_way = (plru[idx][0] == 0) ? (plru[idx][1] == 0 ? 2'd0 : 2'd1) : (plru[idx][2] == 0 ? 2'd2 : 2'd3);
-
-    parameter IDLE       = 3'd0;
-    parameter ALLOCATE   = 3'd1;
-    parameter WB_WBB     = 3'd2; // Write back the WBB
-    parameter FLUSH      = 3'd3;
     
-    reg [2:0] state, next_state;
-    reg [5:0] flush_cnt;
+    parameter IDLE     = 2'd0;
+    parameter WAIT_EB  = 2'd1;
+    parameter ALLOCATE = 2'd2; 
+    parameter FLUSH    = 2'd3;
+    
+    reg [1:0] state, next_state;
+    reg [6:0] flush_cnt; 
     reg [1:0] way_sel_reg;
+    
+    // 🔥 Background Eviction Buffer (EB)
+    reg         eb_valid;
+    reg [31:4]  eb_addr;
+    reg [127:0] eb_data;
 
-    // Write-Back Buffer
-    reg         wbb_valid;
-    reg [23:0]  wbb_tag;
-    reg [3:0]   wbb_idx;
-    reg [127:0] wbb_data;
+    wire eb_hazard = eb_valid && (eb_addr == i_cpu_addr[31:4]);
+    
+    wire evict_valid = (evict_way == 2'd0) ? val_0[idx] : (evict_way == 2'd1) ? val_1[idx] : (evict_way == 2'd2) ? val_2[idx] : val_3[idx];
+    wire evict_dirty = (evict_way == 2'd0) ? dty_0[idx] : (evict_way == 2'd1) ? dty_1[idx] : (evict_way == 2'd2) ? dty_2[idx] : dty_3[idx];
+    wire [23:0] evict_tag = (evict_way == 2'd0) ? tag_0[idx] : (evict_way == 2'd1) ? tag_1[idx] : (evict_way == 2'd2) ? tag_2[idx] : tag_3[idx];
+    wire [127:0] evict_data = (evict_way == 2'd0) ? dat_0[idx] : (evict_way == 2'd1) ? dat_1[idx] : (evict_way == 2'd2) ? dat_2[idx] : dat_3[idx];
 
-    // WBB Hazard: CPU requests the SAME line that is in WBB
-    wire wbb_hazard = wbb_valid && (wbb_idx == idx) && (wbb_tag == cur_tag);
+    wire [3:0] f_idx = flush_cnt[3:0];
+    wire [1:0] f_way = flush_cnt[5:4];
+    wire f_valid = (f_way == 2'd0) ? val_0[f_idx] : (f_way == 2'd1) ? val_1[f_idx] : (f_way == 2'd2) ? val_2[f_idx] : val_3[f_idx];
+    wire f_dirty = (f_way == 2'd0) ? dty_0[f_idx] : (f_way == 2'd1) ? dty_1[f_idx] : (f_way == 2'd2) ? dty_2[f_idx] : dty_3[f_idx];
+    wire [23:0] f_tag = (f_way == 2'd0) ? tag_0[f_idx] : (f_way == 2'd1) ? tag_1[f_idx] : (f_way == 2'd2) ? tag_2[f_idx] : tag_3[f_idx];
+    wire [127:0] f_data = (f_way == 2'd0) ? dat_0[f_idx] : (f_way == 2'd1) ? dat_1[f_idx] : (f_way == 2'd2) ? dat_2[f_idx] : dat_3[f_idx];
 
     always @(posedge clk) begin
         if (!rst_n) state <= IDLE;
         else        state <= next_state;
     end
 
+    // 🔥 修復 Critical Path: 將 FLUSH 動作改為透過 EB 暫存器輸出
     always @(*) begin
         case(state)
             IDLE: begin
-                if (i_flush) next_state = FLUSH;
-                else if (cpu_req && !hit) begin
-                    // If WBB is valid and we need another eviction, or WBB hazard, must clear WBB first
-                    if (wbb_valid && (dirty[idx][evict_way] || wbb_hazard)) next_state = WB_WBB;
+                if (i_flush) begin
+                    if (eb_valid) next_state = WAIT_EB; else next_state = FLUSH;
+                end else if (cpu_req && !hit) begin
+                    if (eb_valid || eb_hazard) next_state = WAIT_EB; 
                     else next_state = ALLOCATE;
-                end else if (wbb_valid) begin
-                    next_state = WB_WBB; // Flush WBB in background
                 end else next_state = IDLE;
             end
-            WB_WBB:   next_state = (i_mem_ready) ? IDLE : WB_WBB;
+            WAIT_EB: begin
+                if (i_mem_ready) begin
+                    if (i_flush) next_state = FLUSH;
+                    else next_state = ALLOCATE;
+                end else next_state = WAIT_EB;
+            end
             ALLOCATE: next_state = (i_mem_ready) ? IDLE : ALLOCATE;
             FLUSH: begin
-                if (flush_cnt == 63 && (!valid[15][3] || !dirty[15][3] || i_mem_ready)) begin
-                    if (wbb_valid) next_state = WB_WBB; // Final WBB clear
-                    else next_state = IDLE;
-                end else if (valid[flush_cnt[3:0]][flush_cnt[5:4]] && dirty[flush_cnt[3:0]][flush_cnt[5:4]])
-                    next_state = (i_mem_ready) ? FLUSH : FLUSH; 
-                else next_state = FLUSH;
+                if (flush_cnt >= 64) begin
+                    next_state = IDLE;
+                end else if (f_valid && f_dirty) begin
+                    next_state = WAIT_EB; 
+                end else begin
+                    next_state = FLUSH;
+                end
             end
             default: next_state = IDLE;
         endcase
@@ -836,104 +814,99 @@ module DCACHE (
         else if (state == IDLE && cpu_req && !hit) way_sel_reg <= evict_way;
     end
 
+    // 🔥 乾淨的 Combinational 輸出，徹底切斷 flush_cnt 的負擔
     always @(*) begin
-        o_mem_read  = 0;
-        o_mem_write = 0;
-        o_mem_addr  = 28'b0;
-        o_mem_wdata = 128'b0;
-        if (state == WB_WBB) begin
-            o_mem_write = 1;
-            o_mem_addr  = {wbb_tag, wbb_idx};
-            o_mem_wdata = wbb_data;
+        o_mem_read  = 0; o_mem_write = 0; o_mem_addr  = 28'b0; o_mem_wdata = 128'b0;
+        
+        if (state == WAIT_EB) begin
+            o_mem_write = 1; o_mem_addr  = eb_addr; o_mem_wdata = eb_data;
+        end else if (state == IDLE && eb_valid && !i_flush) begin
+            o_mem_write = 1; o_mem_addr  = eb_addr; o_mem_wdata = eb_data;
         end else if (state == ALLOCATE) begin
-            o_mem_read  = 1;
-            o_mem_addr  = i_cpu_addr[31:4];
-        end else if (state == FLUSH && flush_cnt < 64) begin
-            if (valid[flush_cnt[3:0]][flush_cnt[5:4]] && dirty[flush_cnt[3:0]][flush_cnt[5:4]]) begin
-                o_mem_write = 1;
-                o_mem_addr  = {tag[flush_cnt[3:0]][flush_cnt[5:4]], flush_cnt[3:0]};
-                o_mem_wdata = data[flush_cnt[3:0]][flush_cnt[5:4]];
-            end
+            o_mem_read  = 1; o_mem_addr  = i_cpu_addr[31:4];
         end
     end
 
-    // Stall if missing and either:
-    // 1. We are allocating/flushing/wb_wbb
-    // 2. We have a WBB hazard
-    assign o_cpu_stall = (cpu_req && !hit) || (state != IDLE && state != FLUSH) || wbb_hazard;
-    assign o_cpu_valid = hit && (state == IDLE) && !wbb_hazard;
+    assign o_cpu_stall = (cpu_req && !hit) || (state != IDLE && state != FLUSH) || eb_hazard;
+    assign o_cpu_valid = hit && (state == IDLE) && !eb_hazard;
     
-    wire [127:0] hit_block = data[idx][hit_way];
-    assign o_cpu_rdata = (word_offset == 2'b00) ? hit_block[31:0] :
-                         (word_offset == 2'b01) ? hit_block[63:32] :
-                         (word_offset == 2'b10) ? hit_block[95:64] : hit_block[127:96];
+    wire [127:0] hit_block = hit0 ? dat_0[idx] : hit1 ? dat_1[idx] : hit2 ? dat_2[idx] : dat_3[idx];
+    assign o_cpu_rdata = (word_offset == 2'b00) ? hit_block[31:0] : (word_offset == 2'b01) ? hit_block[63:32] : (word_offset == 2'b10) ? hit_block[95:64] : hit_block[127:96];
 
-    integer i, w;
+    integer i;
     always @(posedge clk) begin
         if (!rst_n) begin
             for (i=0; i<16; i=i+1) begin
-                for (w=0; w<4; w=w+1) begin
-                    valid[i][w] <= 0;
-                    dirty[i][w] <= 0;
-                end
+                val_0[i] <= 0; val_1[i] <= 0; val_2[i] <= 0; val_3[i] <= 0;
+                dty_0[i] <= 0; dty_1[i] <= 0; dty_2[i] <= 0; dty_3[i] <= 0;
                 plru[i] <= 0;
             end
-            flush_cnt <= 0;
-            o_flush_done <= 0;
-            wbb_valid <= 0;
+            flush_cnt <= 0; o_flush_done <= 0; eb_valid <= 0;
         end else begin
-            if (state == FLUSH && next_state == IDLE && !wbb_valid) o_flush_done <= 1;
-            else if (state == WB_WBB && next_state == IDLE && i_flush) o_flush_done <= 1; // Done with final flush
+            if (o_mem_write && i_mem_ready) eb_valid <= 0;
+            
+            if (state == FLUSH && next_state == IDLE) o_flush_done <= 1;
             else o_flush_done <= 0;
-
+            
             case(state)
                 IDLE: begin
                     if (i_flush) flush_cnt <= 0;
-                    if (cpu_req && hit && !wbb_hazard) begin
-                        // Update PLRU on hit
+                    if (cpu_req && hit && !eb_hazard) begin
                         if (hit_way == 0) begin plru[idx][0] <= 1; plru[idx][1] <= 1; end
                         else if (hit_way == 1) begin plru[idx][0] <= 1; plru[idx][1] <= 0; end
                         else if (hit_way == 2) begin plru[idx][0] <= 0; plru[idx][2] <= 1; end
                         else if (hit_way == 3) begin plru[idx][0] <= 0; plru[idx][2] <= 0; end
 
                         if (i_cpu_wen) begin
-                            dirty[idx][hit_way] <= 1;
-                            if (word_offset == 2'b00) data[idx][hit_way][31:0]   <= i_cpu_wdata;
-                            if (word_offset == 2'b01) data[idx][hit_way][63:32]  <= i_cpu_wdata;
-                            if (word_offset == 2'b10) data[idx][hit_way][95:64]  <= i_cpu_wdata;
-                            if (word_offset == 2'b11) data[idx][hit_way][127:96] <= i_cpu_wdata;
+                            if (hit_way == 0) begin dty_0[idx] <= 1;
+                                if (word_offset == 2'b00) dat_0[idx][31:0]   <= i_cpu_wdata;
+                                if (word_offset == 2'b01) dat_0[idx][63:32]  <= i_cpu_wdata;
+                                if (word_offset == 2'b10) dat_0[idx][95:64]  <= i_cpu_wdata;
+                                if (word_offset == 2'b11) dat_0[idx][127:96] <= i_cpu_wdata;
+                            end else if (hit_way == 1) begin dty_1[idx] <= 1;
+                                if (word_offset == 2'b00) dat_1[idx][31:0]   <= i_cpu_wdata;
+                                if (word_offset == 2'b01) dat_1[idx][63:32]  <= i_cpu_wdata;
+                                if (word_offset == 2'b10) dat_1[idx][95:64]  <= i_cpu_wdata;
+                                if (word_offset == 2'b11) dat_1[idx][127:96] <= i_cpu_wdata;
+                            end else if (hit_way == 2) begin dty_2[idx] <= 1;
+                                if (word_offset == 2'b00) dat_2[idx][31:0]   <= i_cpu_wdata;
+                                if (word_offset == 2'b01) dat_2[idx][63:32]  <= i_cpu_wdata;
+                                if (word_offset == 2'b10) dat_2[idx][95:64]  <= i_cpu_wdata;
+                                if (word_offset == 2'b11) dat_2[idx][127:96] <= i_cpu_wdata;
+                            end else if (hit_way == 3) begin dty_3[idx] <= 1;
+                                if (word_offset == 2'b00) dat_3[idx][31:0]   <= i_cpu_wdata;
+                                if (word_offset == 2'b01) dat_3[idx][63:32]  <= i_cpu_wdata;
+                                if (word_offset == 2'b10) dat_3[idx][95:64]  <= i_cpu_wdata;
+                                if (word_offset == 2'b11) dat_3[idx][127:96] <= i_cpu_wdata;
+                            end
                         end
                     end
-                    // Moving to ALLOCATE: if dirty, buffer it
-                    if (next_state == ALLOCATE && dirty[idx][evict_way] && valid[idx][evict_way]) begin
-                        wbb_valid <= 1;
-                        wbb_tag   <= tag[idx][evict_way];
-                        wbb_idx   <= idx;
-                        wbb_data  <= data[idx][evict_way];
+                    
+                    if (cpu_req && !hit && !eb_valid && !eb_hazard && evict_dirty) begin
+                        eb_valid <= 1; eb_addr <= {evict_tag, idx}; eb_data <= evict_data;
                     end
                 end
-                WB_WBB: begin
-                    if (i_mem_ready) wbb_valid <= 0;
+                WAIT_EB: begin
+                    // Does nothing here, written asynchronously
                 end
                 ALLOCATE: begin
                     if (i_mem_ready) begin
-                        valid[idx][way_sel_reg] <= 1; 
-                        dirty[idx][way_sel_reg] <= 0; 
-                        tag[idx][way_sel_reg]   <= cur_tag; 
-                        data[idx][way_sel_reg]  <= i_mem_rdata;
-                        // Update PLRU on fill
-                        if (way_sel_reg == 0) begin plru[idx][0] <= 1; plru[idx][1] <= 1; end
-                        else if (way_sel_reg == 1) begin plru[idx][0] <= 1; plru[idx][1] <= 0; end
-                        else if (way_sel_reg == 2) begin plru[idx][0] <= 0; plru[idx][2] <= 1; end
-                        else if (way_sel_reg == 3) begin plru[idx][0] <= 0; plru[idx][2] <= 0; end
+                        if (way_sel_reg == 0) begin val_0[idx] <= 1; dty_0[idx] <= 0; tag_0[idx] <= cur_tag; dat_0[idx] <= i_mem_rdata; plru[idx][0] <= 1; plru[idx][1] <= 1; end
+                        else if (way_sel_reg == 1) begin val_1[idx] <= 1; dty_1[idx] <= 0; tag_1[idx] <= cur_tag; dat_1[idx] <= i_mem_rdata; plru[idx][0] <= 1; plru[idx][1] <= 0; end
+                        else if (way_sel_reg == 2) begin val_2[idx] <= 1; dty_2[idx] <= 0; tag_2[idx] <= cur_tag; dat_2[idx] <= i_mem_rdata; plru[idx][0] <= 0; plru[idx][2] <= 1; end
+                        else if (way_sel_reg == 3) begin val_3[idx] <= 1; dty_3[idx] <= 0; tag_3[idx] <= cur_tag; dat_3[idx] <= i_mem_rdata; plru[idx][0] <= 0; plru[idx][2] <= 0; end
                     end
                 end
                 FLUSH: begin
                     if (flush_cnt < 64) begin
-                        if (!(valid[flush_cnt[3:0]][flush_cnt[5:4]] && dirty[flush_cnt[3:0]][flush_cnt[5:4]])) 
+                        if (f_valid && f_dirty) begin
+                            eb_valid <= 1; eb_addr <= {f_tag, f_idx}; eb_data <= f_data;
+                            if (f_way == 2'd0) dty_0[f_idx] <= 0;
+                            else if (f_way == 2'd1) dty_1[f_idx] <= 0;
+                            else if (f_way == 2'd2) dty_2[f_idx] <= 0;
+                            else dty_3[f_idx] <= 0;
                             flush_cnt <= flush_cnt + 1;
-                        else if (i_mem_ready) begin
-                            dirty[flush_cnt[3:0]][flush_cnt[5:4]] <= 0;
+                        end else begin
                             flush_cnt <= flush_cnt + 1;
                         end
                     end
